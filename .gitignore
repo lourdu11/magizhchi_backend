@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+
+# Environment Variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# WhatsApp Session (EXTREMELY SENSITIVE)
+auth_info/
+.wwebjs_cache/
+.wwebjs_auth/
+.whatsapp-session/
+
+# Temporary / Scratch files
+scratch/
+test-edit.js
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE / Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Temporary files
+temp/
+tmp/
+.cache/
+
+# Build output
+dist/
+build/
