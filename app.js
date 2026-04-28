@@ -109,6 +109,10 @@ if (process.env.NODE_ENV !== 'test') {
 // app.use('/api', defaultLimiter);
 
 // ─── Health Check ─────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({ success: true, message: 'Welcome to Magizhchi API' });
+});
+
 app.get('/api/v1/health', (req, res) => {
   res.json({ success: true, message: 'Magizhchi API is running', timestamp: new Date().toISOString() });
 });

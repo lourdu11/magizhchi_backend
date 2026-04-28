@@ -66,6 +66,10 @@ const initWhatsApp = async () => {
         if (qr) {
             logger.info('📱 WhatsApp: Scan this QR Code to connect:');
             qrcode.generate(qr, { small: true });
+            
+            // Also provide a clickable link for cloud environments where terminal QR might be distorted
+            const qrLink = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qr)}&size=300x300`;
+            logger.info(`🔗 QR Link (if terminal QR is distorted): ${qrLink}`);
         }
 
         if (connection === 'close') {
