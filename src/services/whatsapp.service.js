@@ -170,6 +170,26 @@ const sendOrderCancellationNotificationToAdmin = async (order, reason) => {
     return await sendMessage(adminPhone, msg);
 };
 
+const sendProductNotificationToAdmin = async (product, action = 'updated') => {
+    const { adminPhone } = await getAdminSettings();
+    if (!adminPhone) return;
+
+    const emoji = action === 'created' ? '✨' : '📝';
+    const title = action === 'created' ? 'NEW PRODUCT CREATED' : 'PRODUCT UPDATED';
+
+    const msg = `${emoji} *${title}*\n` +
+                `*Magizhchi Garments*\n` +
+                `──────────────────\n\n` +
+                `🏷️ *Name:* ${product.name}\n` +
+                `📦 *SKU:* ${product.sku}\n` +
+                `💰 *Price:* ₹${product.sellingPrice.toLocaleString('en-IN')}\n` +
+                `🗂️ *Category:* ${product.category?.name || 'N/A'}\n\n` +
+                `──────────────────\n` +
+                `*Check Admin Dashboard for full details.*`;
+
+    return await sendMessage(adminPhone, msg);
+};
+
 const sendWhatsAppOTP = async (phone, otp) => {
     const { storeName } = await getAdminSettings();
     const msg = `🔐 *SECURE OTP*\n` +
@@ -200,5 +220,6 @@ module.exports = {
     sendOrderNotificationToAdmin,
     sendOrderCancellationNotificationToAdmin,
     sendContactMessageNotificationToAdmin,
+    sendProductNotificationToAdmin,
     isReady: () => isReady
 };
