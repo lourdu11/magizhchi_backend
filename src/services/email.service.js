@@ -220,4 +220,72 @@ const sendLowStockEmail = async (email, item, currentStock) => {
   logger.info(`Low stock alert email sent to: ${email} [product: ${item.productName}]`);
 };
 
-module.exports = { sendOTPEmail, sendOrderConfirmationEmail, sendLowStockEmail };
+/**
+ * Admin Notification: New Order
+ */
+const sendAdminOrderNotificationEmail = async (order) => {
+  const settings = await Settings.findOne().lean();
+  const email = settings?.notifications?.email?.alertEmail || settings?.store?.email || process.env.EMAIL_USER;
+  if (!email) {
+    logger.warn('Admin Order Notification: No alert email configured in settings or environment.');
+    return;
+  }
+
+  const { storeName, from } = await getEmailSettings();
+  const transporter = await getTransporter();
+
+  const itemsSummary = order.items.map(item => `- ${item.productName} (${item.variant?.size}/${item.variant?.color}) x${item.quantity}`).join('\n');
+
+  const html = `
+<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#f5f5f5;font-family:'Segoe UI',Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f5;padding:30px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.08);">
+        <tr><td style="background:#1A1A1A;padding:28px 40px;text-align:center;">
+          <div style="font-family:Georgia,serif;font-size:22px;font-weight:bold;color:#D4AF37;letter-spacing:5px;">MAGIZHCHI</div>
+          <div style="font-size:9px;color:rgba(255,255,255,0.4);letter-spacing:5px;">GARMENTS</div>
+        </td></tr>
+        <tr><td style="padding:40px;">
+          <h2 style="margin:0 0 20px;color:#1A1A1A;font-size:20px;">🛍️ New Order Received!</h2>
+          <div style="background:#f9f9f9;border-radius:8px;padding:20px;margin-bottom:24px;">
+            <p style="margin:0 0 10px;"><strong>Order Number:</strong> #${order.orderNumber}</p>
+            <p style="margin:0 0 10px;"><strong>Customer:</strong> ${order.shippingAddress?.name || 'Guest'}</p>
+            <p style="margin:0 0 10px;"><strong>Phone:</strong> ${order.shippingAddress?.phone || 'N/A'}</p>
+            <p style="margin:0 0 10px;"><strong>Total Amount:</strong> <span style="color:#D4AF37;font-weight:bold;">Rs. ${order.pricing?.totalAmount?.toLocaleString('en-IN')}</span></p>
+            <p style="margin:0;"><strong>Payment Method:</strong> ${order.paymentMethod?.toUpperCase()}</p>
+          </div>
+          <p style="margin:0 0 10px;font-weight:bold;">Items Summary:</p>
+          <pre style="background:#f5f5f5;padding:15px;border-radius:6px;font-family:monospace;white-space:pre-wrap;margin:0 0 24px;">${itemsSummary}</pre>
+          <div style="text-align:center;">
+            <a href="${process.env.FRONTEND_URL}/admin/orders/${order._id}" 
+               style="background:#1A1A1A;color:#D4AF37;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block;">
+               View Order in Dashboard
+            </a>
+          </div>
+        </td></tr>
+        <tr><td style="background:#f9f9f9;border-top:1px solid #eee;padding:16px 40px;text-align:center;">
+          <p style="margin:0;color:#bbb;font-size:11px;">Admin Notification — ${storeName}</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+  try {
+    await transporter.sendMail({
+      from,
+      to: email,
+      subject: `🛍️ NEW ORDER: #${order.orderNumber} — ${storeName}`,
+      html,
+      text: `New order received: #${order.orderNumber}\nCustomer: ${order.shippingAddress?.name}\nTotal: Rs. ${order.pricing?.totalAmount}\nItems:\n${itemsSummary}`,
+    });
+    logger.info(`Admin order notification sent to: ${email}`);
+  } catch (err) {
+    logger.error('Admin Order Notification Error:', err.message);
+  }
+};
+
+module.exports = { sendOTPEmail, sendOrderConfirmationEmail, sendLowStockEmail, sendAdminOrderNotificationEmail };

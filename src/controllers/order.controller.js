@@ -151,7 +151,9 @@ exports.createOrder = async (req, res, next) => {
 
     if (req.user) await Cart.findOneAndUpdate({ userId: req.user._id }, { items: [] });
 
+    const { sendAdminOrderNotificationEmail } = require('../services/email.service');
     sendOrderNotificationToAdmin(order).catch(() => {});
+    sendAdminOrderNotificationEmail(order).catch(() => {});
 
     return ApiResponse.created(res, { order: { _id: order._id, orderNumber: order.orderNumber, totalAmount }, razorpayOrder });
   } catch (error) { 

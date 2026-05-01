@@ -15,6 +15,9 @@ auth_info/
 .whatsapp-session/
 .whatsapp-session-old-trash/
 session/
+qr.png
+*.session
+*.session-journal
 
 # Temporary / Scratch files
 scratch/
@@ -40,6 +43,7 @@ yarn-error.log*
 *.swp
 *.swo
 .DS_Store
+Thumbs.db
 
 # Temporary files
 temp/
@@ -49,3 +53,16 @@ tmp/
 # Build output
 dist/
 build/
+
+# Archives & Large Files
+*.zip
+*.rar
+*.7z
+*.tar.gz
+*.iso
+*.bak
+
+# Database
+dump/
+data/
+*.sqlite

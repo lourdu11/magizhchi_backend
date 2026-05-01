@@ -53,7 +53,10 @@ const sendOTP = async (identifier, purpose = 'register') => {
       logger.error(`❌ EMAIL OTP SEND ERROR to ${identifier}:`, err.message);
       if (isDev) {
         logger.warn(`Email send failed — This is common in Dev if SMTP is not set. OTP is printed in terminal above.`);
-        return { method: 'dev_console', message: 'OTP sent to terminal (Email Error: ' + err.message + ')' };
+        return { 
+          method: 'dev_console', 
+          message: `OTP logged in terminal (Email failed: ${err.message}). Check your .env SMTP settings.` 
+        };
       }
       throw err;
     }
@@ -68,7 +71,10 @@ const sendOTP = async (identifier, purpose = 'register') => {
       logger.error(`❌ WHATSAPP OTP SEND ERROR to ${identifier}:`, err.message);
       if (isDev) {
         logger.warn(`WhatsApp send failed — Ensure QR is scanned. Falling back to terminal log.`);
-        return { method: 'dev_console', message: 'OTP sent to terminal (WhatsApp Error: ' + err.message + ')' };
+        return { 
+          method: 'dev_console', 
+          message: `OTP logged in terminal (WhatsApp failed: ${err.message}). Check if QR is scanned.` 
+        };
       }
       throw err;
     }

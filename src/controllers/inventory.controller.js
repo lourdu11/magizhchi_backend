@@ -29,27 +29,75 @@ exports.getInventory = async (req, res, next) => {
     if (offlineEnabled !== undefined) query.offlineEnabled = offlineEnabled === 'true';
     if (req.query.unlinkedOnly === 'true') query.productRef = null;
 
-    const skip = (Number(page) - 1) * Number(limit);
+    const limitNum = Number(limit);
+    const skipNum = (Number(page) - 1) * limitNum;
 
-    const [items, total] = await Promise.all([
-      Inventory.find(query).sort({ createdAt: -1 }).skip(skip).limit(Number(limit)).lean({ virtuals: true }),
-      Inventory.countDocuments(query),
-    ]);
+    // Use aggregation to handle virtual-like calculations in the query
+    const pipeline = [
+      { $match: query },
+      {
+        $addFields: {
+          availableStock: {
+            $max: [
+              0,
+              { 
+                $subtract: [
+                  { $add: ["$totalStock", "$returned"] },
+                  { $add: ["$onlineSold", "$offlineSold", { $ifNull: ["$reservedStock", 0] }, "$damaged"] }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ];
 
-    // Post-filter by status virtual
-    let filtered = items;
     if (status) {
-      filtered = items.filter(i => {
-        const avail = Math.max(0, i.totalStock - i.onlineSold - i.offlineSold - (i.reservedStock || 0) + i.returned - i.damaged);
-        if (status === 'out_of_stock') return avail === 0;
-        if (status === 'low_stock')    return avail > 0 && avail <= (i.lowStockThreshold || 5);
-        if (status === 'in_stock')     return avail > (i.lowStockThreshold || 5);
-        return true;
-      });
+      if (status === 'out_of_stock') {
+        pipeline.push({ $match: { availableStock: 0 } });
+      } else if (status === 'low_stock') {
+        pipeline.push({ 
+          $match: { 
+            $and: [
+              { availableStock: { $gt: 0 } },
+              { $expr: { $lte: ["$availableStock", { $ifNull: ["$lowStockThreshold", 5] }] } }
+            ]
+          } 
+        });
+      } else if (status === 'in_stock') {
+        pipeline.push({ 
+          $match: { 
+            $expr: { $gt: ["$availableStock", { $ifNull: ["$lowStockThreshold", 5] }] } 
+          } 
+        });
+      }
     }
 
-    return ApiResponse.paginated(res, filtered, {
-      page: Number(page), limit: Number(limit), total, pages: Math.ceil(total / Number(limit))
+    const [results] = await Inventory.aggregate([
+      {
+        $facet: {
+          data: [
+            ...pipeline,
+            { $sort: { createdAt: -1 } },
+            { $skip: skipNum },
+            { $limit: limitNum }
+          ],
+          total: [
+            ...pipeline,
+            { $count: "count" }
+          ]
+        }
+      }
+    ]);
+
+    const items = results.data;
+    const total = results.total[0]?.count || 0;
+
+    return ApiResponse.paginated(res, items, {
+      page: Number(page),
+      limit: limitNum,
+      total,
+      pages: Math.ceil(total / limitNum)
     });
   } catch (error) { next(error); }
 };
