@@ -1,6 +1,0 @@
-2026/04/28-15:04:40.030 4818 Reusing MANIFEST D:\magizhchi\backend\.whatsapp-session\session\Default\Local Storage\leveldb/MANIFEST-000001
-2026/04/28-15:04:40.037 4818 Recovering log #77
-2026/04/28-15:04:40.039 4818 Reusing old log D:\magizhchi\backend\.whatsapp-session\session\Default\Local Storage\leveldb/000077.log 
-2026/04/28-15:04:56.455 6774 Level-0 table #81: started
-2026/04/28-15:04:56.459 6774 Level-0 table #81: 17103 bytes OK
-2026/04/28-15:04:56.461 6774 Delete type=0 #77
