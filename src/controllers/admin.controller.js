@@ -1,54 +1,119 @@
+const mongoose = require('mongoose');
 const Order = require('../models/Order');
 const Product = require('../models/Product');
 const User = require('../models/User');
 const Bill = require('../models/Bill');
 const Settings = require('../models/Settings');
 const ApiResponse = require('../utils/apiResponse');
+const Inventory = require('../models/Inventory');
+const Purchase = require('../models/Purchase');
+
+const lowStockPipeline = [
+  { $addFields: {
+      availableStock: {
+        $max: [0, { $subtract: [
+          { $add: ['$totalStock', '$returned'] },
+          { $add: ['$onlineSold', '$offlineSold', { $ifNull: ['$reservedStock', 0] }, '$damaged'] }
+        ]}]
+      }
+  }},
+  { $match: { $expr: { $lte: ['$availableStock', { $ifNull: ['$lowStockThreshold', 5] }] } } },
+  { $sort: { availableStock: 1 } },
+];
 
 exports.getDashboardStats = async (req, res, next) => {
   try {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const thisMonth = new Date(today.getFullYear(), today.getMonth(), 1);
-    const thisYear = new Date(today.getFullYear(), 0, 1);
 
     const [
-      todayOrders, monthOrders, yearOrders,
-      pendingOrders, shippedOrders, deliveredOrders, cancelledOrders,
-      totalUsers, totalProducts,
-      lowStockProducts, recentOrders,
+      revenueStats,
+      pendingOrders, deliveredOrders,
+      registeredUsers, uniqueGuests,
+      lowStockInventory,
+      supplierStats,
+      wastageStats
     ] = await Promise.all([
-      Order.aggregate([{ $match: { createdAt: { $gte: today }, orderStatus: { $nin: ['cancelled', 'returned'] } } }, { $group: { _id: null, revenue: { $sum: '$pricing.totalAmount' }, count: { $sum: 1 } } }]),
-      Order.aggregate([{ $match: { createdAt: { $gte: thisMonth }, orderStatus: { $nin: ['cancelled', 'returned'] } } }, { $group: { _id: null, revenue: { $sum: '$pricing.totalAmount' }, count: { $sum: 1 } } }]),
-      Order.aggregate([{ $match: { createdAt: { $gte: thisYear }, orderStatus: { $nin: ['cancelled', 'returned'] } } }, { $group: { _id: null, revenue: { $sum: '$pricing.totalAmount' }, count: { $sum: 1 } } }]),
+      // 1. Revenue & Cost Aggregation
+      Order.aggregate([
+        { $match: { orderStatus: { $nin: ['cancelled', 'returned'] } } },
+        { $unwind: '$items' },
+        { $lookup: { from: 'inventories', localField: 'items.inventoryId', foreignField: '_id', as: 'inv' } },
+        { $unwind: '$inv' },
+        { $group: {
+            _id: null,
+            todayRevenue: { $sum: { $cond: [{ $gte: ['$createdAt', today] }, '$items.total', 0] } },
+            todayCost: { $sum: { $cond: [{ $gte: ['$createdAt', today] }, { $multiply: ['$inv.purchasePrice', '$items.quantity'] }, 0] } },
+            monthRevenue: { $sum: { $cond: [{ $gte: ['$createdAt', thisMonth] }, '$items.total', 0] } },
+        }},
+        { $unionWith: {
+            coll: 'bills',
+            pipeline: [
+              { $unwind: '$items' },
+              { $lookup: { from: 'inventories', localField: 'items.inventoryId', foreignField: '_id', as: 'inv' } },
+              { $unwind: '$inv' },
+              { $group: {
+                  _id: null,
+                  todayRevenue: { $sum: { $cond: [{ $gte: ['$createdAt', today] }, '$items.total', 0] } },
+                  todayCost: { $sum: { $cond: [{ $gte: ['$createdAt', today] }, { $multiply: ['$inv.purchasePrice', '$items.quantity'] }, 0] } },
+                  monthRevenue: { $sum: { $cond: [{ $gte: ['$createdAt', thisMonth] }, '$items.total', 0] } },
+              }}
+            ]
+        }},
+        { $group: {
+            _id: null,
+            todayRevenue: { $sum: '$todayRevenue' },
+            todayCost: { $sum: '$todayCost' },
+            monthRevenue: { $sum: '$monthRevenue' }
+        }}
+      ]),
       Order.countDocuments({ orderStatus: { $in: ['placed', 'confirmed', 'processing'] } }),
-      Order.countDocuments({ orderStatus: 'shipped' }),
       Order.countDocuments({ orderStatus: 'delivered' }),
-      Order.countDocuments({ orderStatus: 'cancelled' }),
       User.countDocuments({ role: 'user' }),
-      Product.countDocuments({ isActive: true }),
-      Product.find({ isActive: true }).then(products =>
-        products.filter(p => p.totalStock < (p.lowStockThreshold || 10)).slice(0, 10)
-      ),
-      Order.find().sort({ createdAt: -1 }).limit(10).populate('userId', 'name email'),
+      Order.distinct('shippingAddress.phone', { isGuestOrder: true }),
+      // 2. Low Stock Inventory
+      Inventory.aggregate([
+        { $addFields: {
+            avail: { $subtract: [{ $add: ['$totalStock', '$returned'] }, { $add: ['$onlineSold', '$offlineSold', '$reservedStock', '$damaged'] }] }
+        }},
+        { $match: { $expr: { $lte: ['$avail', '$lowStockThreshold'] } } },
+        { $limit: 10 }
+      ]),
+      // 3. Supplier Payables
+      require('../models/Supplier').aggregate([
+        { $group: {
+            _id: null,
+            totalPayables: { $sum: { $subtract: [{ $add: ['$openingBalance', '$totalPurchaseAmount'] }, '$totalPaidAmount'] } }
+        }}
+      ]),
+      // 4. Wastage
+      require('../models/Wastage').aggregate([
+        { $match: { createdAt: { $gte: today } } },
+        { $group: { _id: null, todayLoss: { $sum: '$lossAmount' } } }
+      ])
     ]);
+
+    const stats = revenueStats[0] || { todayRevenue: 0, todayCost: 0, monthRevenue: 0 };
+    const payables = supplierStats[0]?.totalPayables || 0;
+    const wastageLoss = wastageStats[0]?.todayLoss || 0;
 
     return ApiResponse.success(res, {
       revenue: {
-        today: todayOrders[0]?.revenue || 0,
-        month: monthOrders[0]?.revenue || 0,
-        year: yearOrders[0]?.revenue || 0,
+        today: stats.todayRevenue,
+        month: stats.monthRevenue,
+        todayProfit: stats.todayRevenue - stats.todayCost,
+      },
+      erp: {
+        totalPayables: payables,
+        todayWastage: wastageLoss,
       },
       orders: {
-        todayCount: todayOrders[0]?.count || 0,
-        monthCount: monthOrders[0]?.count || 0,
-        pending: pendingOrders, shipped: shippedOrders,
-        delivered: deliveredOrders, cancelled: cancelledOrders,
+        pending: pendingOrders,
+        delivered: deliveredOrders,
       },
-      users: totalUsers,
-      products: totalProducts,
-      lowStockProducts,
-      recentOrders,
+      users: (registeredUsers || 0) + (uniqueGuests?.length || 0),
+      lowStockProducts: lowStockInventory,
     });
   } catch (error) { next(error); }
 };
@@ -56,122 +121,305 @@ exports.getDashboardStats = async (req, res, next) => {
 exports.getSalesAnalytics = async (req, res, next) => {
   try {
     const { period = 'monthly', year = new Date().getFullYear() } = req.query;
-    let groupBy, match;
+    let groupBy, match, prevMatch;
+    const now = new Date();
 
     if (period === 'daily') {
       const startOf = new Date(); startOf.setDate(startOf.getDate() - 30);
-      match = { createdAt: { $gte: startOf }, orderStatus: { $nin: ['cancelled', 'returned'] } };
+      const prevStartOf = new Date(startOf); prevStartOf.setDate(prevStartOf.getDate() - 30);
+      match = { createdAt: { $gte: startOf } };
+      prevMatch = { createdAt: { $gte: prevStartOf, $lt: startOf } };
       groupBy = { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } };
     } else if (period === 'monthly') {
-      match = { createdAt: { $gte: new Date(year, 0, 1) }, orderStatus: { $nin: ['cancelled', 'returned'] } };
+      match = { createdAt: { $gte: new Date(year, 0, 1) } };
+      prevMatch = { createdAt: { $gte: new Date(year - 1, 0, 1), $lt: new Date(year, 0, 1) } };
       groupBy = { $dateToString: { format: '%Y-%m', date: '$createdAt' } };
     } else {
-      match = { orderStatus: { $nin: ['cancelled', 'returned'] } };
+      match = {};
+      prevMatch = { createdAt: { $lt: new Date(year, 0, 1) } }; // Generic prev
       groupBy = { $dateToString: { format: '%Y', date: '$createdAt' } };
     }
 
-    // Define previous period for growth comparison
-    let previousMatch = { ...match };
-    const now = new Date();
-    if (period === 'daily') {
-      const startOfPrev = new Date(); startOfPrev.setDate(startOfPrev.getDate() - 60);
-      const endOfPrev = new Date(); endOfPrev.setDate(endOfPrev.getDate() - 30);
-      previousMatch.createdAt = { $gte: startOfPrev, $lt: endOfPrev };
-    } else if (period === 'monthly') {
-      const startOfPrev = new Date(year - 1, 0, 1);
-      const endOfPrev = new Date(year - 1, 11, 31);
-      previousMatch.createdAt = { $gte: startOfPrev, $lt: endOfPrev };
-    }
+    const orderMatch = { ...match, orderStatus: { $nin: ['cancelled', 'returned'] } };
+    const prevOrderMatch = { ...prevMatch, orderStatus: { $nin: ['cancelled', 'returned'] } };
 
-    const [salesTrend, categoryData, paymentData, topProducts, topCustomers, locationData, currentSummary, previousSummary] = await Promise.all([
+    const results = await Promise.all([
+      // 0. Combined Sales Trend
       Order.aggregate([
-        { $match: match },
-        { $group: { _id: groupBy, revenue: { $sum: '$pricing.totalAmount' }, orders: { $sum: 1 } } },
+        { $match: orderMatch },
+        { $project: { revenue: { $ifNull: ['$pricing.totalAmount', 0] }, createdAt: 1 } },
+        { $unionWith: { coll: 'bills', pipeline: [ { $match: match }, { $project: { revenue: { $ifNull: ['$pricing.totalAmount', 0] }, createdAt: 1 } } ] }},
+        { $group: { _id: groupBy, revenue: { $sum: '$revenue' }, orders: { $sum: 1 } } },
         { $sort: { _id: 1 } },
       ]),
+      // 1. Combined Category Performance
       Order.aggregate([
-        { $match: match },
-        { $unwind: '$items' },
+        { $match: orderMatch },
+        { $unwind: { path: '$items', preserveNullAndEmptyArrays: true } },
+        { $unionWith: { 
+            coll: 'bills', 
+            pipeline: [ 
+              { $match: match }, 
+              { $unwind: { path: '$items', preserveNullAndEmptyArrays: true } }, 
+              { $project: { items: 1 } } 
+            ] 
+        }},
         { $lookup: { from: 'products', localField: 'items.productId', foreignField: '_id', as: 'product' } },
-        { $unwind: '$product' },
+        { $unwind: { path: '$product', preserveNullAndEmptyArrays: true } },
         { $lookup: { from: 'categories', localField: 'product.category', foreignField: '_id', as: 'category' } },
-        { $unwind: '$category' },
-        { $group: { _id: '$category.name', revenue: { $sum: { $multiply: ['$items.price', '$items.quantity'] } }, count: { $sum: '$items.quantity' } } },
+        { $unwind: { path: '$category', preserveNullAndEmptyArrays: true } },
+        { $group: { _id: { $ifNull: ['$category.name', 'Uncategorized'] }, revenue: { $sum: { $ifNull: ['$items.total', 0] } }, count: { $sum: { $ifNull: ['$items.quantity', 0] } } } },
         { $sort: { revenue: -1 } }
       ]),
+      // 2. Combined Payment Methods
       Order.aggregate([
-        { $match: match },
-        { $group: { _id: '$paymentMethod', revenue: { $sum: '$pricing.totalAmount' }, count: { $sum: 1 } } }
+        { $match: orderMatch },
+        { $project: { method: '$paymentMethod', revenue: { $ifNull: ['$pricing.totalAmount', 0] } } },
+        { $unionWith: { coll: 'bills', pipeline: [ { $match: match }, { $project: { method: '$paymentMethod', revenue: { $ifNull: ['$pricing.totalAmount', 0] } } } ] }},
+        { $group: { _id: '$method', revenue: { $sum: '$revenue' }, count: { $sum: 1 } } },
+        { $sort: { revenue: -1 } }
       ]),
+      // 3. Regional Performance (Including Offline as Tamil Nadu)
       Order.aggregate([
-        { $match: match },
-        { $unwind: '$items' },
-        { $lookup: { from: 'products', localField: 'items.productId', foreignField: '_id', as: 'product' } },
-        { $unwind: '$product' },
-        { $group: { _id: '$product.name', sales: { $sum: '$items.quantity' }, revenue: { $sum: { $multiply: ['$items.price', '$items.quantity'] } } } },
-        { $sort: { sales: -1 } },
-        { $limit: 5 }
-      ]),
-      Order.aggregate([
-        { $match: match },
-        { $group: { _id: '$userId', totalSpent: { $sum: '$pricing.totalAmount' }, orders: { $sum: 1 } } },
-        { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
-        { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
-        { $project: { name: { $ifNull: ['$user.name', 'Guest User'] }, email: { $ifNull: ['$user.email', 'N/A'] }, totalSpent: 1, orders: 1 } },
-        { $sort: { totalSpent: -1 } },
-        { $limit: 5 }
-      ]),
-      Order.aggregate([
-        { $match: match },
-        { $group: { _id: '$shippingAddress.state', revenue: { $sum: '$pricing.totalAmount' }, orders: { $sum: 1 } } },
+        { $match: orderMatch },
+        { $project: { state: { $ifNull: ['$shippingAddress.state', 'Tamil Nadu'] }, revenue: { $ifNull: ['$pricing.totalAmount', 0] } } },
+        { $unionWith: { coll: 'bills', pipeline: [ { $match: match }, { $project: { state: 'Tamil Nadu', revenue: { $ifNull: ['$pricing.totalAmount', 0] } } } ] }},
+        { $group: { _id: '$state', revenue: { $sum: '$revenue' }, orders: { $sum: 1 } } },
         { $sort: { revenue: -1 } },
         { $limit: 8 }
       ]),
-      Order.aggregate([
-        { $match: match },
-        { $group: { _id: null, totalRevenue: { $sum: '$pricing.totalAmount' }, totalOrders: { $sum: 1 } } }
+      // 4. Combined Summary & Growth
+      Promise.all([
+        Order.aggregate([
+          { $match: orderMatch },
+          { $unionWith: { coll: 'bills', pipeline: [ { $match: match } ] }},
+          { $group: { _id: null, totalRevenue: { $sum: '$pricing.totalAmount' }, totalOrders: { $sum: 1 } } }
+        ]),
+        Order.aggregate([
+          { $match: prevOrderMatch },
+          { $unionWith: { coll: 'bills', pipeline: [ { $match: prevMatch } ] }},
+          { $group: { _id: null, totalRevenue: { $sum: '$pricing.totalAmount' } } }
+        ])
       ]),
-      Order.aggregate([
-        { $match: previousMatch },
-        { $group: { _id: null, totalRevenue: { $sum: '$pricing.totalAmount' } } }
+      // 5. ERP: Dead Stock
+      Inventory.aggregate([
+        { $addFields: { 
+            sold: { $add: [{ $ifNull: ['$onlineSold', 0] }, { $ifNull: ['$offlineSold', 0] }] },
+            ageDays: { $divide: [{ $subtract: [new Date(), { $ifNull: ['$createdAt', new Date()] }] }, 86400000] }
+        }},
+        { $match: { sold: 0, totalStock: { $gt: 0 }, ageDays: { $gt: 30 } } },
+        { $limit: 10 }
+      ]),
+      // 6. ERP: Low Margin Products
+      Inventory.aggregate([
+        { $addFields: {
+            margin: { $cond: [{ $gt: [{ $ifNull: ['$sellingPrice', 0] }, 0] }, { $divide: [{ $subtract: ['$sellingPrice', '$purchasePrice'] }, '$sellingPrice'] }, 0] }
+        }},
+        { $match: { margin: { $lt: 0.20 }, sellingPrice: { $gt: 0 } } },
+        { $sort: { margin: 1 } },
+        { $limit: 10 }
+      ]),
+      // 7. ERP: Stock Aging
+      Inventory.aggregate([
+        { $addFields: { 
+            age: { $divide: [{ $subtract: [new Date(), { $ifNull: ['$createdAt', new Date()] }] }, 86400000] } 
+        }},
+        { $group: {
+            _id: {
+              $cond: [
+                { $lt: ['$age', 30] }, '0-30 Days',
+                { $cond: [{ $lt: ['$age', 60] }, '31-60 Days', '60+ Days'] }
+              ]
+            },
+            count: { $sum: 1 },
+            value: { $sum: { $multiply: [{ $ifNull: ['$purchasePrice', 0] }, { $subtract: [{ $ifNull: ['$totalStock', 0] }, { $add: [{ $ifNull: ['$onlineSold', 0] }, { $ifNull: ['$offlineSold', 0] }, { $ifNull: ['$damaged', 0] }] }] }] } }
+        }}
       ])
     ]);
 
-    const currentRevenue = currentSummary[0]?.totalRevenue || 0;
-    const prevRevenue = previousSummary[0]?.totalRevenue || 0;
-    const growth = prevRevenue > 0 ? ((currentRevenue - prevRevenue) / prevRevenue) * 100 : 0;
+    const currentStats = results[4][0][0] || { totalRevenue: 0, totalOrders: 0 };
+    const previousStats = results[4][1][0] || { totalRevenue: 0 };
+    
+    // Calculate Growth %
+    let growth = 0;
+    if (previousStats.totalRevenue > 0) {
+      growth = parseFloat(((currentStats.totalRevenue - previousStats.totalRevenue) / previousStats.totalRevenue * 100).toFixed(1));
+    } else if (currentStats.totalRevenue > 0) {
+      growth = 100;
+    }
+
+    // --- HIGH IMPACT FEATURES (ADDITIONAL DATA) ---
+    const [extraMetrics, recentActivity] = await Promise.all([
+      // 1. Staff Leaderboard (From Bills)
+      Bill.aggregate([
+        { $match: match },
+        { $group: { _id: '$staffId', totalSales: { $sum: '$pricing.totalAmount' }, txns: { $sum: 1 } } },
+        { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'staff' } },
+        { $unwind: { path: '$staff', preserveNullAndEmptyArrays: true } },
+        { $project: { name: { $ifNull: ['$staff.name', 'System Admin'] }, totalSales: 1, txns: 1 } },
+        { $sort: { totalSales: -1 } },
+        { $limit: 5 }
+      ]),
+      // 2. Recent Combined Activity (Real-time Stream)
+      Promise.all([
+        Order.find().sort({ createdAt: -1 }).limit(10).select('billNumber pricing.totalAmount createdAt isGuestOrder shippingAddress.name'),
+        Bill.find().sort({ createdAt: -1 }).limit(10).select('billNumber pricing.totalAmount createdAt staffName customerDetails.name')
+      ]).then(([orders, bills]) => {
+        const combined = [
+          ...orders.map(o => ({ type: 'ONLINE', id: o.billNumber || 'ORD', total: o.pricing.totalAmount, date: o.createdAt, name: o.shippingAddress?.name || 'Guest' })),
+          ...bills.map(b => ({ type: 'OFFLINE', id: b.billNumber, total: b.pricing.totalAmount, date: b.createdAt, name: b.customerDetails?.name || 'Retail' }))
+        ];
+        return combined.sort((a,b) => b.date - a.date).slice(0, 15);
+      }),
+      // 3. Top Products with Images
+      Order.aggregate([
+        { $match: orderMatch },
+        { $unwind: '$items' },
+        { $unionWith: { coll: 'bills', pipeline: [ { $match: match }, { $unwind: '$items' } ] }},
+        { $group: { _id: '$items.productId', name: { $first: '$items.productName' }, qty: { $sum: '$items.quantity' }, rev: { $sum: '$items.total' } } },
+        { $lookup: { from: 'products', localField: '_id', foreignField: '_id', as: 'p' } },
+        { $unwind: { path: '$p', preserveNullAndEmptyArrays: true } },
+        { $project: { name: 1, qty: 1, rev: 1, image: { $arrayElemAt: ['$p.images', 0] } } },
+        { $sort: { qty: -1 } },
+        { $limit: 8 }
+      ])
+    ]);
+
+    const staffPerformance = extraMetrics;
+    const topProducts = await Promise.resolve(recentActivity); // Wait, I misaligned indices
+    const topProductsVisual = (await Promise.all([Order.aggregate([
+      { $match: orderMatch },
+      { $unwind: '$items' },
+      { $unionWith: { coll: 'bills', pipeline: [ { $match: match }, { $unwind: '$items' } ] }},
+      { $group: { _id: '$items.productId', name: { $first: '$items.productName' }, qty: { $sum: '$items.quantity' }, rev: { $sum: '$items.total' } } },
+      { $lookup: { from: 'products', localField: '_id', foreignField: '_id', as: 'p' } },
+      { $unwind: { path: '$p', preserveNullAndEmptyArrays: true } },
+      { $project: { name: 1, qty: 1, rev: 1, image: { $arrayElemAt: ['$p.images', 0] } } },
+      { $sort: { qty: -1 } },
+      { $limit: 8 }
+    ])]))[0];
 
     return ApiResponse.success(res, { 
-      data: salesTrend, 
-      categoryData, 
-      paymentData, 
-      topProducts,
-      topCustomers,
-      locationData,
+      data: results[0], 
+      categoryData: results[1], 
+      paymentData: results[2], 
+      locationData: results[3],
       summary: {
-        ...(currentSummary[0] || { totalRevenue: 0, totalOrders: 0 }),
-        growth: growth.toFixed(1)
+        totalRevenue: currentStats.totalRevenue,
+        totalOrders: currentStats.totalOrders,
+        growth: growth,
+        avgTicket: currentStats.totalRevenue / (currentStats.totalOrders || 1)
+      },
+      staffPerformance,
+      recentActivity: recentActivity,
+      topProducts: topProductsVisual,
+      erp: {
+        deadStock: results[5],
+        lowMarginItems: results[6],
+        stockAging: results[7]
       }
     });
-  } catch (error) { next(error); }
+  } catch (error) { 
+    console.error('Analytics Error:', error);
+    return res.status(500).json({ success: false, message: 'Analytics aggregation failed', error: error.message });
+  }
 };
 
 exports.getAllUsers = async (req, res, next) => {
   try {
     const { page = 1, limit = 20, search, role } = req.query;
-    const query = {};
-    if (role) query.role = role;
-    if (search) query.$or = [
+    const skip = (Number(page) - 1) * Number(limit);
+    
+    // 1. Fetch Registered Users
+    const userQuery = {};
+    if (role && role !== 'guest') userQuery.role = role;
+    if (search) userQuery.$or = [
       { name: { $regex: search, $options: 'i' } },
       { email: { $regex: search, $options: 'i' } },
       { phone: { $regex: search, $options: 'i' } },
     ];
-    const skip = (page - 1) * limit;
-    const [users, total] = await Promise.all([
-      User.find(query).select('-password -refreshToken').sort({ createdAt: -1 }).skip(skip).limit(Number(limit)),
-      User.countDocuments(query),
-    ]);
-    return ApiResponse.paginated(res, users, { page: Number(page), limit: Number(limit), total, pages: Math.ceil(total / limit) });
+
+    // 1. Fetch Registered Users with Stats
+    let users = [];
+    let totalUsers = 0;
+
+    if (role !== 'guest') {
+      users = await User.aggregate([
+        { $match: userQuery },
+        { $lookup: {
+            from: 'orders',
+            localField: '_id',
+            foreignField: 'userId',
+            as: 'orders'
+        }},
+        { $project: {
+            _id: 1, name: 1, email: 1, phone: 1, role: 1, isBlocked: 1, createdAt: 1,
+            orderCount: { $size: '$orders' },
+            totalSpent: { $sum: '$orders.pricing.totalAmount' }
+        }},
+        { $sort: { createdAt: -1 } }
+      ]);
+      totalUsers = users.length;
+    }
+
+    // 2. Fetch Unique Guests from Orders with Stats
+    let guests = [];
+    if (!role || role === 'guest' || role === 'user') {
+      const guestMatch = { 
+        $or: [
+          { userId: null }, 
+          { isGuestOrder: true }, 
+          { userId: { $exists: false } }
+        ] 
+      };
+      
+      if (search) {
+        const searchCriteria = {
+          $or: [
+            { 'shippingAddress.name': { $regex: search, $options: 'i' } },
+            { 'shippingAddress.phone': { $regex: search, $options: 'i' } },
+            { 'guestDetails.name': { $regex: search, $options: 'i' } },
+            { 'guestDetails.phone': { $regex: search, $options: 'i' } }
+          ]
+        };
+        var finalGuestMatch = { $and: [ guestMatch, searchCriteria ] };
+      } else {
+        var finalGuestMatch = guestMatch;
+      }
+
+      guests = await Order.aggregate([
+        { $match: finalGuestMatch },
+        { $group: {
+            _id: { $ifNull: ['$shippingAddress.phone', '$guestDetails.phone'] },
+            name: { $first: { $ifNull: ['$shippingAddress.name', '$guestDetails.name'] } },
+            email: { $first: { $ifNull: ['$shippingAddress.email', '$guestDetails.email'] } },
+            phone: { $first: { $ifNull: ['$shippingAddress.phone', '$guestDetails.phone'] } },
+            createdAt: { $min: '$createdAt' },
+            orderCount: { $sum: 1 },
+            totalSpent: { $sum: '$pricing.totalAmount' }
+        }},
+        { $project: { 
+            _id: { $concat: ["guest_", { $ifNull: ["$phone", { $toString: "$_id" }] }] }, 
+            name: 1, email: 1, phone: 1, createdAt: 1, orderCount: 1, totalSpent: 1,
+            role: { $literal: 'guest' }, 
+            isBlocked: { $literal: false } 
+        }}
+      ]);
+    }
+
+    // 3. Merge and Paginate
+    let allCustomers = [...users, ...guests];
+    allCustomers.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    
+    const total = allCustomers.length;
+    const paginatedItems = allCustomers.slice(skip, skip + Number(limit));
+
+    return ApiResponse.paginated(res, paginatedItems, { 
+      page: Number(page), 
+      limit: Number(limit), 
+      total, 
+      pages: Math.ceil(total / Number(limit)) 
+    });
   } catch (error) { next(error); }
 };
 
@@ -193,6 +441,22 @@ exports.createStaff = async (req, res, next) => {
   } catch (error) { next(error); }
 };
 
+exports.updateStaff = async (req, res, next) => {
+  try {
+    const { name, email, phone, password } = req.body;
+    const staff = await User.findOne({ _id: req.params.id, role: 'staff' });
+    if (!staff) return ApiResponse.notFound(res, 'Staff not found');
+
+    staff.name = name || staff.name;
+    staff.email = email || staff.email;
+    staff.phone = phone || staff.phone;
+    if (password) staff.password = password;
+
+    await staff.save();
+    return ApiResponse.success(res, { staff: { _id: staff._id, name: staff.name, email: staff.email, phone: staff.phone, role: 'staff' } }, 'Staff account updated');
+  } catch (error) { next(error); }
+};
+
 exports.getStaff = async (req, res, next) => {
   try {
     const staff = await User.find({ role: 'staff' }).select('-password -refreshToken').sort({ createdAt: -1 });
@@ -208,15 +472,99 @@ exports.deleteStaff = async (req, res, next) => {
   } catch (error) { next(error); }
 };
 
+exports.getStaffPerformance = async (req, res, next) => {
+  try {
+    const performance = await Bill.aggregate([
+      {
+        $group: {
+          _id: '$staffId',
+          totalSales: { $sum: '$pricing.totalAmount' },
+          totalBills: { $sum: 1 },
+          totalCommission: { $sum: '$commissionAmount' }
+        }
+      },
+      {
+        $lookup: {
+          from: 'users',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'staff'
+        }
+      },
+      { $unwind: '$staff' },
+      {
+        $project: {
+          name: '$staff.name',
+          totalSales: 1,
+          totalBills: 1,
+          totalCommission: 1,
+          commissionRate: '$staff.commissionRate'
+        }
+      },
+      { $sort: { totalSales: -1 } }
+    ]);
+    return ApiResponse.success(res, performance);
+  } catch (error) { next(error); }
+};
+
 exports.getLowStock = async (req, res, next) => {
   try {
-    const products = await Product.find({ isActive: true });
-    const lowStock = products.filter(p =>
-      p.totalStock < (p.lowStockThreshold || 10)
-    );
+    const lowStock = await Inventory.aggregate(lowStockPipeline);
     return ApiResponse.success(res, lowStock);
   } catch (error) { next(error); }
 };
+exports.updateSettings = async (req, res, next) => {
+  try {
+    const { testAlert, ...settingsData } = req.body;
+    
+    let settings = await Settings.findOne();
+    if (!settings) {
+      settings = await Settings.create(settingsData);
+    } else {
+      // ── PREVENTION: Don't overwrite password/API key with empty strings ──
+      // Use a flat object to update specific nested fields without overwriting entire sub-objects
+      const updateData = {};
+      
+      const flatten = (obj, prefix = '') => {
+        Object.keys(obj).forEach(key => {
+          const value = obj[key];
+          const newKey = prefix ? `${prefix}.${key}` : key;
+          
+          // Skip sensitive fields if they are empty
+          const isSensitive = ['password', 'apiKey', 'razorpayKeySecret'].includes(key);
+          if (isSensitive && !value) return;
+
+          if (value && typeof value === 'object' && !Array.isArray(value) && !(value instanceof mongoose.Types.ObjectId)) {
+            flatten(value, newKey);
+          } else {
+            updateData[newKey] = value;
+          }
+        });
+      };
+
+      flatten(settingsData);
+      
+      settings = await Settings.findByIdAndUpdate(settings._id, { $set: updateData }, { new: true });
+    }
+
+    if (testAlert) {
+      const { checkAndAlertLowStock } = require('../utils/lowStockAlert');
+      // Trigger a dummy alert
+      checkAndAlertLowStock({
+        productName: 'TEST PRODUCT (SETTINGS TEST)',
+        color: 'GOLD',
+        size: 'XL',
+        availableStock: 2,
+        lowStockThreshold: 5
+      }).catch((e) => {
+        logger.error('Test Alert Trigger Error:', e.message);
+      });
+    }
+
+    return ApiResponse.success(res, settings, 'Settings updated successfully');
+  } catch (error) { next(error); }
+};
+
 exports.getSettings = async (req, res, next) => {
   try {
     let settings = await Settings.findOne();
@@ -225,31 +573,26 @@ exports.getSettings = async (req, res, next) => {
   } catch (error) { next(error); }
 };
 
-exports.updateSettings = async (req, res, next) => {
-  try {
-    // Find the first document or create it
-    const existing = await Settings.findOne();
-    const settings = await Settings.findOneAndUpdate(
-      existing ? { _id: existing._id } : {}, 
-      { $set: req.body }, 
-      { upsert: true, new: true, runValidators: true }
-    );
-    
-    return ApiResponse.success(res, settings, 'Settings updated successfully');
-  } catch (error) { next(error); }
-};
-
 exports.getPublicSettings = async (req, res, next) => {
   try {
     const settings = await Settings.findOne()
-      .select('store shipping.freeShippingThreshold payment.codEnabled seo')
+      .select('store shipping payment seo')
       .lean();
     
     // Ensure the response structure is always complete even if DB doc is empty
     const response = {
-      store: settings?.store || {},
-      shipping: settings?.shipping || { codEnabled: true, freeShippingThreshold: 999 },
-      payment: settings?.payment || { codEnabled: true },
+      store: { 
+        name: 'Magizhchi Garments', email: '', phone: '', address: '', gstin: '', 
+        ...(settings?.store || {}) 
+      },
+      shipping: { 
+        flatRateTN: 50, flatRateOut: 100, freeShippingThreshold: 999,
+        ...(settings?.shipping || {}) 
+      },
+      payment: { 
+        onlineEnabled: true, codEnabled: true, codCharges: 50, codThreshold: 50000,
+        ...(settings?.payment || {}) 
+      },
       seo: settings?.seo || {}
     };
 

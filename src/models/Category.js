@@ -8,6 +8,7 @@ const categorySchema = new mongoose.Schema(
     image: { type: String },
     parentCategory: { type: mongoose.Schema.Types.ObjectId, ref: 'Category', default: null },
     isActive: { type: Boolean, default: true },
+    sizeChart: { type: String }, // URL to size chart image
     displayOrder: { type: Number, default: 0 },
   },
   { timestamps: true }

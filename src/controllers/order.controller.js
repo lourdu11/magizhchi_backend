@@ -1,6 +1,7 @@
 const Order = require('../models/Order');
 const User = require('../models/User');
 const Product = require('../models/Product');
+const Inventory = require('../models/Inventory');
 const Coupon = require('../models/Coupon');
 const Cart = require('../models/Cart');
 const StockMovement = require('../models/StockMovement');
@@ -12,272 +13,242 @@ const ApiResponse = require('../utils/apiResponse');
 const crypto = require('crypto');
 const logger = require('../utils/logger');
 
-// GST Logic: Now dynamic based on product.gstPercentage
-
 // POST /orders/create
 exports.createOrder = async (req, res, next) => {
   try {
     const { items, shippingAddress, billingAddress, paymentMethod, couponCode, notes, guestDetails } = req.body;
 
-    // Check if COD is enabled globally
+    const settings = await Settings.findOne() || {};
+    const shippingConfig = settings.shipping || { flatRateTN: 50, flatRateOut: 100, freeShippingThreshold: 999 };
+
     if (paymentMethod === 'cod') {
-      const settings = await Settings.findOne();
-      if (settings && settings.payment && settings.payment.codEnabled === false) {
+      if (settings?.payment?.codEnabled === false) {
         return ApiResponse.error(res, 'Cash on Delivery is currently disabled.', 400);
       }
     }
 
-    const settings = await Settings.findOne() || {};
-    const shippingConfig = settings.shipping || { flatRate: 50, freeShippingThreshold: 999 };
-
-    // --- Build order items with live prices ---
     let subtotal = 0;
     const orderItems = [];
 
+    // 1. Build order items and check stock in Inventory
     for (const item of items) {
       const product = await Product.findById(item.productId);
       if (!product || !product.isActive) throw { message: `Product not available: ${item.productId}`, statusCode: 400 };
 
-      const variant = product.variants.find(v => v.size === item.size && v.color === item.color);
-      if (!variant) throw { message: 'Variant not found', statusCode: 400 };
+      // Find matching Inventory row (case-insensitive)
+      const invItem = await Inventory.findOne({
+        productName: { $regex: new RegExp('^' + product.name.trim() + '$', 'i') },
+        size: { $regex: new RegExp('^' + item.size.trim() + '$', 'i') },
+        color: { $regex: new RegExp('^' + item.color.trim() + '$', 'i') },
+        onlineEnabled: true
+      });
 
-      const available = variant.stock - variant.reservedStock;
-      if (available < item.quantity) throw { message: `Insufficient stock for ${product.name} (${item.size}/${item.color})`, statusCode: 400 };
+      if (!invItem) throw { message: `Inventory not found for ${product.name} (${item.size}/${item.color})`, statusCode: 404 };
 
-      const price = product.discountedPrice || product.sellingPrice;
-      const gstRate = (product.gstPercentage || 12) / 100;
-      const taxableValue = parseFloat((price * item.quantity / (1 + gstRate)).toFixed(2));
-      const gstAmount = parseFloat((price * item.quantity - taxableValue).toFixed(2));
-      const itemTotal = price * item.quantity;
+      // Formula for available: totalStock - onlineSold - offlineSold - reservedStock + returned - damaged
+      const available = (invItem.totalStock || 0) - (invItem.onlineSold || 0) - (invItem.offlineSold || 0) - (invItem.reservedStock || 0) + (invItem.returned || 0) - (invItem.damaged || 0);
+      if (available < item.quantity) throw { message: `Insufficient stock for ${product.name}`, statusCode: 400 };
+
+      const price = Number(product.sellingPrice || invItem.sellingPrice || 0);
+      const qty = Number(item.quantity || 1);
+      const gstRate = Number(product.gstPercentage || 5) / 100;
+      const taxableValue = parseFloat((price * qty / (1 + gstRate)).toFixed(2));
+      const gstAmount = parseFloat((price * qty - taxableValue).toFixed(2));
+      const itemTotal = price * qty;
 
       orderItems.push({
         productId: product._id, productName: product.name,
-        productImage: product.images[0], sku: product.sku,
+        productImage: product.images[0], sku: invItem.sku || product.sku,
         hsnCode: product.hsnCode || '6205',
         variant: { size: item.size, color: item.color },
-        quantity: item.quantity, price,
+        quantity: qty, price,
         taxableValue, cgst: gstAmount / 2, sgst: gstAmount / 2, total: itemTotal,
+        inventoryId: invItem._id
       });
       subtotal += itemTotal;
     }
 
-    // --- Coupon validation ---
+    // 2. Coupon logic
     let couponDiscount = 0;
     if (couponCode) {
       const coupon = await Coupon.findOne({ code: couponCode.toUpperCase(), isActive: true });
       if (coupon && new Date() >= coupon.validFrom && new Date() <= coupon.validTo) {
         if (subtotal >= coupon.minPurchaseAmount) {
-          if (coupon.discountType === 'percentage') {
-            couponDiscount = Math.min((subtotal * coupon.discountValue) / 100, coupon.maxDiscountAmount || Infinity);
-          } else {
-            couponDiscount = Math.min(coupon.discountValue, subtotal);
-          }
-          await Coupon.findByIdAndUpdate(coupon._id, { $inc: { usageCount: 1 }, $push: { usedBy: req.user?._id } });
+          couponDiscount = coupon.discountType === 'percentage' 
+            ? Math.min((subtotal * (coupon.discountValue || 0)) / 100, coupon.maxDiscountAmount || Infinity)
+            : Math.min(coupon.discountValue || 0, subtotal);
+          
+          // Only push to usedBy if user is authenticated
+          const couponUpdate = { $inc: { usageCount: 1 } };
+          if (req.user?._id) couponUpdate.$push = { usedBy: req.user._id };
+          await Coupon.findByIdAndUpdate(coupon._id, couponUpdate);
         }
       }
     }
 
     const afterDiscount = subtotal - couponDiscount;
-    // Note: gstAmount is now the sum of individual item taxes for precision
-    const totalGst = orderItems.reduce((sum, item) => sum + (item.cgst + item.sgst), 0);
-    const shipping = afterDiscount >= shippingConfig.freeShippingThreshold ? 0 : shippingConfig.flatRate;
+    const totalGst = orderItems.reduce((sum, item) => sum + (Number(item.cgst || 0) + Number(item.sgst || 0)), 0);
+    // Use state-based shipping rate (Tamil Nadu vs rest of India)
+    const isTN = (shippingAddress?.state || '').toLowerCase().includes('tamil');
+    const flatRate = isTN
+      ? (shippingConfig.flatRateTN ?? shippingConfig.flatRate ?? 50)
+      : (shippingConfig.flatRateOut ?? shippingConfig.flatRate ?? 100);
+    const shipping = afterDiscount >= shippingConfig.freeShippingThreshold ? 0 : flatRate;
     const totalAmount = parseFloat((afterDiscount + shipping).toFixed(2));
 
-    // --- Reserve stock ---
+    // 3. Reserve stock in Inventory (Atomic)
     for (const item of orderItems) {
-      await Product.updateOne(
+      const reserveResult = await Inventory.updateOne(
         { 
-          _id: item.productId, 
-          variants: { $elemMatch: { size: item.variant.size, color: item.variant.color } }
+          _id: item.inventoryId,
+          $expr: {
+            $gte: [
+              { $subtract: [{ $add: ["$totalStock", "$returned"] }, { $add: ["$onlineSold", "$offlineSold", "$reservedStock", "$damaged"] }] },
+              item.quantity
+            ]
+          }
         },
-        { $inc: { 'variants.$.reservedStock': item.quantity } }
+        { $inc: { reservedStock: item.quantity } }
       );
+
+      if (reserveResult.modifiedCount === 0) {
+        throw { message: `Stock collision for ${item.productName}. Please refresh.`, statusCode: 400 };
+      }
     }
 
-    // --- Razorpay order (if online payment) ---
+    // 4. Razorpay order
     let razorpayOrder = null;
     if (paymentMethod === 'razorpay') {
-      if (!isRazorpayConfigured) {
-        return ApiResponse.error(res, 'Online payment is currently unavailable. Please use Cash on Delivery.', 400);
-      }
+      if (!isRazorpayConfigured) throw { message: 'Online payment unavailable', statusCode: 400 };
       razorpayOrder = await razorpay.orders.create({
-
-        amount: Math.round(totalAmount * 100), // paise
+        amount: Math.round(totalAmount * 100),
         currency: 'INR',
         receipt: `rcpt_${Date.now()}`,
       });
     }
 
-    const estimatedDeliveryDate = new Date();
-    estimatedDeliveryDate.setDate(estimatedDeliveryDate.getDate() + 5);
-
-    // Generate Sequential Order Number: ORD-YYYYMMDD-MAG001
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-    const todayEnd = new Date();
-    todayEnd.setHours(23, 59, 59, 999);
-    const countToday = await Order.countDocuments({ createdAt: { $gte: todayStart, $lte: todayEnd } });
-    const sequence = (countToday + 1).toString().padStart(3, '0');
+    // 5. Generate Order Number
     const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const sequentialOrderNumber = `ORD-${dateStr}-MAG${sequence}`;
+    const countToday = await Order.countDocuments({ createdAt: { $gte: new Date().setHours(0,0,0,0) } });
+    const sequentialOrderNumber = `ORD-${dateStr}-MAG${(countToday + 1).toString().padStart(3, '0')}`;
 
-    // --- Create order (retry on duplicate orderNumber) ---
-    let order;
-    let attempts = 0;
-    while (attempts < 3) {
-      try {
-        order = await Order.create({
-          orderNumber: sequentialOrderNumber,
-          userId: req.user?._id,
-          isGuestOrder: !req.user,
-          guestDetails: !req.user ? guestDetails : undefined,
-          items: orderItems,
-          pricing: { subtotal, couponDiscount, gstAmount: totalGst, shippingCharges: shipping, totalAmount },
-          shippingAddress, billingAddress: billingAddress || shippingAddress,
-          paymentMethod,
-          paymentStatus: paymentMethod === 'cod' ? 'pending' : 'pending',
-          paymentDetails: razorpayOrder ? { razorpayOrderId: razorpayOrder.id } : {},
-          couponCode, notes, estimatedDeliveryDate,
-          statusHistory: [{ status: 'placed', updatedAt: new Date() }],
-        });
-        break; // success
-      } catch (dupErr) {
-        const isDuplicate = dupErr.code === 11000 || (dupErr.message && dupErr.message.includes('E11000'));
-        if (isDuplicate && attempts < 3) {
-          attempts++;
-          logger.warn(`Order number collision (Attempt ${attempts}). Retrying...`);
-          if (attempts >= 3) throw new Error('Could not generate unique order number. Please try again.');
-        } else {
-          throw dupErr;
-        }
-      }
+    const order = await Order.create({
+      orderNumber: sequentialOrderNumber,
+      userId: req.user?._id || null,
+      isGuestOrder: !req.user,
+      guestDetails,
+      items: orderItems,
+      pricing: { subtotal, couponDiscount, gstAmount: totalGst, shippingCharges: shipping, totalAmount },
+      shippingAddress, billingAddress: billingAddress || shippingAddress,
+      paymentMethod,
+      paymentStatus: 'pending',
+      paymentDetails: razorpayOrder ? { razorpayOrderId: razorpayOrder.id } : {},
+      couponCode, notes,
+      statusHistory: [{ status: 'placed', updatedAt: new Date() }],
+    });
 
-    }
+    if (paymentMethod === 'cod') await confirmStockSale(order.items, order._id);
 
+    if (req.user) await Cart.findOneAndUpdate({ userId: req.user._id }, { items: [] });
 
-    // For COD: confirm stock immediately
-    if (paymentMethod === 'cod') {
-      await confirmStockSale(orderItems, order._id);
-    }
-
-    // Clear the cart for authenticated users
-    if (req.user) {
-      await Cart.findOneAndUpdate({ userId: req.user._id }, { items: [] });
-      
-      // Save address to user profile if not already present
-      const user = await User.findById(req.user._id);
-      if (user && shippingAddress) {
-        const addrExists = user.addresses.some(a => 
-          (a.addressLine1 || '').trim().toLowerCase() === (shippingAddress.addressLine1 || '').trim().toLowerCase() && 
-          (a.pincode || '').trim() === (shippingAddress.pincode || '').trim()
-        );
-        if (!addrExists) {
-          user.addresses.push({ ...shippingAddress, isDefault: user.addresses.length === 0 });
-          await user.save();
-          logger.info(`Saved new address for user: ${user._id}`);
-        }
-      }
-    }
-
-    logger.info(`Order created: ${order.orderNumber} | ₹${totalAmount} | ${paymentMethod}`);
-
-    // Notify Admin via WhatsApp
     sendOrderNotificationToAdmin(order).catch(() => {});
 
-    return ApiResponse.created(res, {
-      order: { _id: order._id, orderNumber: order.orderNumber, totalAmount, estimatedDeliveryDate },
-      razorpayOrder,
-    }, 'Order created successfully');
-  } catch (error) { next(error); }
+    return ApiResponse.created(res, { order: { _id: order._id, orderNumber: order.orderNumber, totalAmount }, razorpayOrder });
+  } catch (error) { 
+    if (error.name === 'ValidationError') {
+      console.error('CRITICAL_ORDER_VAL_FAIL:', JSON.stringify(error.errors, null, 2));
+    }
+    next(error); 
+  }
 };
 
-// POST /orders/verify-payment
 exports.verifyPayment = async (req, res, next) => {
   try {
     const { orderId, razorpayOrderId, razorpayPaymentId, razorpaySignature } = req.body;
+    const expectedSignature = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET).update(`${razorpayOrderId}|${razorpayPaymentId}`).digest('hex');
 
-    const expectedSignature = crypto
-      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-      .update(`${razorpayOrderId}|${razorpayPaymentId}`)
-      .digest('hex');
-
-    if (expectedSignature !== razorpaySignature) {
-      return ApiResponse.error(res, 'Payment verification failed. Invalid signature.', 400);
-    }
+    if (expectedSignature !== razorpaySignature) return ApiResponse.error(res, 'Verification failed', 400);
 
     const order = await Order.findById(orderId);
     if (!order) return ApiResponse.notFound(res, 'Order not found');
 
-    // Update payment details
     order.paymentStatus = 'completed';
-    order.paymentDetails.razorpayPaymentId = razorpayPaymentId;
-    order.paymentDetails.razorpaySignature = razorpaySignature;
-    order.paymentDetails.paidAt = new Date();
+    order.paymentDetails = { ...order.paymentDetails, razorpayPaymentId, razorpaySignature, paidAt: new Date() };
     order.orderStatus = 'confirmed';
     order.statusHistory.push({ status: 'confirmed', updatedAt: new Date() });
     await order.save();
 
-    // Permanently deduct stock
     await confirmStockSale(order.items, order._id);
 
-    // Send confirmation email
-    const emailTo = order.isGuestOrder ? order.guestDetails?.email : req.user?.email;
-    if (emailTo) sendOrderConfirmationEmail(emailTo, order).catch(() => {});
-
-    return ApiResponse.success(res, { order: { orderNumber: order.orderNumber } }, 'Payment verified!');
+    return ApiResponse.success(res, { order: { orderNumber: order.orderNumber } }, 'Payment verified');
   } catch (error) { next(error); }
 };
 
 async function confirmStockSale(items, orderId) {
   for (const item of items) {
-    await Product.updateOne(
-      { 
-        _id: item.productId, 
-        variants: { $elemMatch: { size: item.variant.size, color: item.variant.color } }
-      },
-      {
-        $inc: {
-          'variants.$.stock': -item.quantity,
-          'variants.$.reservedStock': -item.quantity,
-          salesCount: item.quantity,
-        },
+    // inventoryId is stored in order items
+    const updated = await Inventory.findByIdAndUpdate(item.inventoryId, {
+      $inc: {
+        onlineSold: item.quantity,
+        reservedStock: -item.quantity
       }
-    );
+    }, { new: true });
+    
+    // ─── LOW STOCK ALERT ───
+    const { checkAndAlertLowStock } = require('../utils/lowStockAlert');
+    checkAndAlertLowStock(updated).catch(() => {});
+
     await StockMovement.create({
-      productId: item.productId, variant: item.variant,
-      type: 'sale', quantity: item.quantity,
+      productId: item.productId, inventoryId: item.inventoryId,
+      variant: item.variant, type: 'sale_online', quantity: item.quantity,
       reason: 'Online order sale', orderId,
     });
   }
 }
 
-// GET /orders/:id (User or Admin)
-exports.getOrder = async (req, res, next) => {
+exports.cancelOrder = async (req, res, next) => {
   try {
-    const isAdmin = req.user?.role === 'admin';
-    const query = isAdmin
-      ? { _id: req.params.id }
-      : { _id: req.params.id, userId: req.user._id };
-    const order = await Order.findOne(query).populate('userId', 'name email phone');
-    if (!order) return ApiResponse.notFound(res, 'Order not found');
-    return ApiResponse.success(res, { order });
+    const order = await Order.findOne({ _id: req.params.id, userId: req.user._id });
+    if (!order || !['placed', 'confirmed'].includes(order.orderStatus)) {
+      return ApiResponse.error(res, 'Cannot cancel order at this stage', 400);
+    }
+
+    for (const item of order.items) {
+      if (order.orderStatus === 'placed') {
+        // Was only reserved — free the reservation
+        await Inventory.findByIdAndUpdate(item.inventoryId, { $inc: { reservedStock: -item.quantity } });
+      } else if (order.orderStatus === 'confirmed') {
+        // Stock was already moved to onlineSold — only reverse the sale
+        await Inventory.findByIdAndUpdate(item.inventoryId, {
+          $inc: { onlineSold: -item.quantity }
+        });
+      }
+    }
+
+    order.orderStatus = 'cancelled';
+    order.cancelReason = req.body.reason || 'Cancelled by customer';
+    order.statusHistory.push({ status: 'cancelled', updatedAt: new Date() });
+    await order.save();
+
+    sendOrderCancellationNotificationToAdmin(order, req.body.reason).catch(() => {});
+    return ApiResponse.success(res, null, 'Order cancelled successfully');
   } catch (error) { next(error); }
 };
 
-// GET /users/orders (User's order history)
+// GET /orders/my-orders (User)
 exports.getUserOrders = async (req, res, next) => {
   try {
     const { page = 1, limit = 10 } = req.query;
-    const skip = (page - 1) * limit;
+    const skip = (Number(page) - 1) * Number(limit);
     const [orders, total] = await Promise.all([
-      Order.find({ userId: req.user._id }).sort({ createdAt: -1 }).skip(skip).limit(Number(limit)).select('-items.taxableValue -items.cgst -items.sgst').lean(),
+      Order.find({ userId: req.user._id }).sort({ createdAt: -1 }).skip(skip).limit(Number(limit)).lean(),
       Order.countDocuments({ userId: req.user._id }),
     ]);
-    return ApiResponse.paginated(res, orders, { page: Number(page), limit: Number(limit), total, pages: Math.ceil(total / limit) });
+    return ApiResponse.paginated(res, orders, { page: Number(page), limit: Number(limit), total, pages: Math.ceil(total / Number(limit)) });
   } catch (error) { next(error); }
 };
 
-// GET /orders (Admin)
+// GET /orders/all (Admin)
 exports.getAllOrders = async (req, res, next) => {
   try {
     const { page = 1, limit = 20, status, payment, search, startDate, endDate } = req.query;
@@ -294,13 +265,23 @@ exports.getAllOrders = async (req, res, next) => {
       { 'shippingAddress.name': { $regex: search, $options: 'i' } },
       { 'shippingAddress.phone': { $regex: search, $options: 'i' } },
     ];
-
-    const skip = (page - 1) * limit;
+    const skip = (Number(page) - 1) * Number(limit);
     const [orders, total] = await Promise.all([
       Order.find(query).populate('userId', 'name email phone').sort({ createdAt: -1 }).skip(skip).limit(Number(limit)).lean(),
       Order.countDocuments(query),
     ]);
-    return ApiResponse.paginated(res, orders, { page: Number(page), limit: Number(limit), total, pages: Math.ceil(total / limit) });
+    return ApiResponse.paginated(res, orders, { page: Number(page), limit: Number(limit), total, pages: Math.ceil(total / Number(limit)) });
+  } catch (error) { next(error); }
+};
+
+// GET /orders/:id (User or Admin)
+exports.getOrder = async (req, res, next) => {
+  try {
+    const isAdmin = req.user?.role === 'admin';
+    const query = isAdmin ? { _id: req.params.id } : { _id: req.params.id, userId: req.user._id };
+    const order = await Order.findOne(query).populate('userId', 'name email phone');
+    if (!order) return ApiResponse.notFound(res, 'Order not found');
+    return ApiResponse.success(res, { order });
   } catch (error) { next(error); }
 };
 
@@ -316,80 +297,35 @@ exports.updateOrderStatus = async (req, res, next) => {
     if (trackingNumber) order.trackingInfo = { carrier, trackingNumber, trackingUrl };
     if (status === 'delivered') order.deliveredAt = new Date();
 
+    // When admin manually confirms: move stock from reserved → sold
+    const wasAlreadyConfirmed = order.statusHistory.some(
+      h => h.status === 'confirmed' && h._id?.toString() !== order.statusHistory[order.statusHistory.length - 1]?._id?.toString()
+    );
+    if (status === 'confirmed' && order.paymentStatus !== 'completed' && !wasAlreadyConfirmed) {
+      await confirmStockSale(order.items, order._id);
+      order.paymentStatus = 'completed';
+    }
+
     await order.save();
     return ApiResponse.success(res, { order }, 'Order status updated');
   } catch (error) { next(error); }
 };
 
-// POST /orders/:id/cancel (User)
-exports.cancelOrder = async (req, res, next) => {
-  try {
-    const order = await Order.findOne({ _id: req.params.id, userId: req.user._id });
-    if (!order) return ApiResponse.notFound(res, 'Order not found');
-    if (!['placed', 'confirmed'].includes(order.orderStatus)) {
-      return ApiResponse.error(res, 'Order cannot be cancelled at this stage', 400);
-    }
-
-    // Properly handle stock based on order status to prevent "Magical Inventory" bug
-    for (const item of order.items) {
-      if (order.orderStatus === 'placed') {
-        // Stock wasn't deducted yet, only reservedStock was increased.
-        await Product.updateOne(
-          { 
-            _id: item.productId, 
-            variants: { $elemMatch: { size: item.variant.size, color: item.variant.color } }
-          },
-          { $inc: { 'variants.$.reservedStock': -item.quantity } }
-        );
-      } else if (order.orderStatus === 'confirmed') {
-        // Stock was deducted. Return it to stock.
-        await Product.updateOne(
-          { 
-            _id: item.productId, 
-            variants: { $elemMatch: { size: item.variant.size, color: item.variant.color } }
-          },
-          { $inc: { 'variants.$.stock': item.quantity, salesCount: -item.quantity } }
-        );
-      }
-    }
-
-    order.orderStatus = 'cancelled';
-    order.cancelReason = req.body.reason || 'Cancelled by customer';
-    order.statusHistory.push({ status: 'cancelled', updatedAt: new Date() });
-    await order.save();
-
-    // Notify Admin via WhatsApp
-    sendOrderCancellationNotificationToAdmin(order, order.cancelReason).catch(() => {});
-
-    return ApiResponse.success(res, null, 'Order cancelled successfully');
-  } catch (error) { next(error); }
-};
-
-// POST /orders/:id/return
+// POST /orders/:id/return (User)
 exports.requestReturn = async (req, res, next) => {
   try {
     const { reason, images } = req.body;
     const order = await Order.findOne({ _id: req.params.id, userId: req.user._id });
-
     if (!order) return ApiResponse.notFound(res, 'Order not found');
     if (order.orderStatus !== 'delivered') return ApiResponse.error(res, 'Only delivered orders can be returned', 400);
-    
-    // Check if within 7 days window
+
     const deliveryDate = new Date(order.deliveredAt);
-    const now = new Date();
-    const diffDays = Math.ceil((now - deliveryDate) / (1000 * 60 * 60 * 24));
+    const diffDays = Math.ceil((new Date() - deliveryDate) / (1000 * 60 * 60 * 24));
     if (diffDays > 7) return ApiResponse.error(res, 'Return window (7 days) has expired', 400);
 
-    order.returnRequest = {
-      isRequested: true,
-      requestedAt: now,
-      reason,
-      images: images || [],
-      status: 'pending'
-    };
-    
+    order.returnRequest = { isRequested: true, requestedAt: new Date(), reason, images: images || [], status: 'pending' };
     await order.save();
-    return ApiResponse.success(res, order, 'Return request submitted successfully');
+    return ApiResponse.success(res, order, 'Return request submitted');
   } catch (error) { next(error); }
 };
 
@@ -398,40 +334,32 @@ exports.updateReturnStatus = async (req, res, next) => {
   try {
     const { status, adminNote, refundAmount } = req.body;
     const order = await Order.findById(req.params.id);
-
-    if (!order || !order.returnRequest.isRequested) {
-      return ApiResponse.error(res, 'Return request not found for this order', 404);
-    }
+    if (!order || !order.returnRequest?.isRequested) return ApiResponse.error(res, 'Return request not found', 404);
 
     order.returnRequest.status = status;
     order.returnRequest.adminNote = adminNote;
-    
+
     if (status === 'approved') {
       order.orderStatus = 'returned';
       order.returnRequest.refundAmount = refundAmount || order.pricing.totalAmount;
       order.returnRequest.refundedAt = new Date();
       order.paymentStatus = 'refunded';
 
-      // Ensure physical items are added back to inventory stock
-      const StockMovement = require('../models/StockMovement');
+      // Return stock to Inventory
       for (const item of order.items) {
-        await Product.updateOne(
-          { 
-            _id: item.productId, 
-            variants: { $elemMatch: { size: item.variant.size, color: item.variant.color } }
-          },
-          { $inc: { 'variants.$.stock': item.quantity, salesCount: -item.quantity } }
-        );
+        // Only increment 'returned' count. 
+        // onlineSold remains as historical data, but 'returned' increases overall available pool.
+        await Inventory.findByIdAndUpdate(item.inventoryId, { $inc: { returned: item.quantity } });
         await StockMovement.create({
-          productId: item.productId, variant: item.variant,
-          type: 'return', quantity: item.quantity,
+          productId: item.productId, inventoryId: item.inventoryId,
+          variant: item.variant, type: 'return_customer', quantity: item.quantity,
           reason: adminNote || 'Customer Return Approved', orderId: order._id,
         });
       }
     }
 
     await order.save();
-    return ApiResponse.success(res, order, `Return request ${status}`);
+    return ApiResponse.success(res, order, `Return ${status}`);
   } catch (error) { next(error); }
 };
 

@@ -1,17 +1,5 @@
 const mongoose = require('mongoose');
 
-const variantSchema = new mongoose.Schema({
-  size: { type: String, required: true },
-  color: { type: String, required: true },
-  stock: { type: Number, required: true, min: 0, default: 0 },
-  reservedStock: { type: Number, default: 0, min: 0 },
-  images: [{ type: String }],
-});
-
-variantSchema.virtual('availableStock').get(function () {
-  return Math.max(0, this.stock - this.reservedStock);
-});
-
 const productSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
@@ -22,11 +10,10 @@ const productSchema = new mongoose.Schema(
     description: { type: String, trim: true },
     shortDescription: { type: String, trim: true },
     images: [{ type: String }],
-    costPrice: { type: Number, required: true, min: 0 },
+    costPrice: { type: Number, min: 0, default: 0 },
     sellingPrice: { type: Number, required: true, min: 0 },
     discountPercentage: { type: Number, default: 0, min: 0, max: 100 },
     discountedPrice: { type: Number },
-    variants: [variantSchema],
     specifications: {
       fabric: { type: String },
       fit: { type: String },
@@ -36,7 +23,6 @@ const productSchema = new mongoose.Schema(
       rise: { type: String },
     },
     gstPercentage: { type: Number, default: 12 },
-
     hsnCode: { type: String, default: '6205' },
     sizeChart: { type: String },
     tags: [String],
@@ -45,6 +31,12 @@ const productSchema = new mongoose.Schema(
     isBestSeller: { type: Boolean, default: false },
     isNewArrival: { type: Boolean, default: true },
     isActive: { type: Boolean, default: true },
+    
+    // ── e-Commerce Policy ──────────────────────────────────
+    codEnabled: { type: Boolean, default: true },
+    isReturnable: { type: Boolean, default: true },
+    deliveryEstimate: { type: String, default: '3-5 business days' },
+
     seo: {
       metaTitle: String,
       metaDescription: String,
@@ -60,7 +52,7 @@ const productSchema = new mongoose.Schema(
   { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } }
 );
 
-// Indexes — slug/sku unique already set in schema field definitions
+// Indexes
 productSchema.index({ name: 'text', description: 'text', tags: 'text' });
 productSchema.index({ category: 1 });
 productSchema.index({ isActive: 1 });
@@ -69,7 +61,6 @@ productSchema.index({ isBestSeller: 1 });
 productSchema.index({ isNewArrival: 1 });
 productSchema.index({ 'ratings.average': -1 });
 productSchema.index({ createdAt: -1 });
-
 
 // Calculate discountedPrice before save
 productSchema.pre('save', function (next) {
@@ -81,12 +72,6 @@ productSchema.pre('save', function (next) {
     this.discountedPrice = this.sellingPrice;
   }
   if (typeof next === 'function') next();
-});
-
-
-// Virtual: total available stock across all variants
-productSchema.virtual('totalStock').get(function () {
-  return (this.variants || []).reduce((sum, v) => sum + Math.max(0, v.stock - v.reservedStock), 0);
 });
 
 module.exports = mongoose.model('Product', productSchema);

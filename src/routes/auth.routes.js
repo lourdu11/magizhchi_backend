@@ -5,6 +5,7 @@ const { protect } = require('../middlewares/auth');
 const { authLimiter, otpLimiter } = require('../middlewares/rateLimiter');
 
 // Public routes
+router.post('/quick-guest', authController.quickGuestUser);
 router.post('/login', authLimiter, authController.login);            // Smart login (auto-creates)
 router.post('/forgot-password', otpLimiter, authController.forgotPassword);  // Email→Email OTP | Phone→WhatsApp
 router.post('/reset-password', authController.resetPassword);

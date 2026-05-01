@@ -17,11 +17,16 @@ exports.addToCart = async (req, res, next) => {
     const product = await Product.findById(productId);
     if (!product || !product.isActive) return ApiResponse.notFound(res, 'Product not found');
 
-    const variant = product.variants.find(v => v.size === size && v.color === color);
-    if (!variant) return ApiResponse.error(res, 'Variant not found', 404);
+    // ─── BUG FIX: Check availability from Inventory (not legacy Product.variants) ─
+    const Inventory = require('../models/Inventory');
+    const invItem = await Inventory.findOne({
+      productName: product.name, size, color, onlineEnabled: true,
+    });
+    if (!invItem) return ApiResponse.error(res, 'This variant is not available for online purchase', 404);
 
-    const available = variant.stock - variant.reservedStock;
-    if (available < quantity) return ApiResponse.error(res, `Only ${available} items available`, 400);
+    const available = invItem.totalStock - invItem.onlineSold - invItem.offlineSold
+      - (invItem.reservedStock || 0) + invItem.returned - invItem.damaged;
+    if (available < quantity) return ApiResponse.error(res, `Only ${Math.max(0, available)} items available`, 400);
 
     let cart = await Cart.findOne({ userId: req.user._id });
     if (!cart) cart = await Cart.create({ userId: req.user._id, items: [] });
@@ -31,7 +36,7 @@ exports.addToCart = async (req, res, next) => {
     );
 
     if (existingIdx > -1) {
-      cart.items[existingIdx].quantity = Math.min(10, cart.items[existingIdx].quantity + quantity);
+      cart.items[existingIdx].quantity = Math.min(available, cart.items[existingIdx].quantity + quantity);
     } else {
       cart.items.push({ productId, variant: { size, color }, quantity });
     }
@@ -54,7 +59,27 @@ exports.updateCartItem = async (req, res, next) => {
     if (quantity <= 0) {
       item.deleteOne();
     } else {
-      item.quantity = Math.min(10, quantity);
+      // Check real-time Inventory availability before allowing qty increase
+      const Inventory = require('../models/Inventory');
+      const populatedItem = await cart.populate('items.productId', 'name');
+      const productName = item.productId?.name;
+      let maxQty = quantity; // default: allow if we can't find inventory
+
+      if (productName) {
+        const inv = await Inventory.findOne({
+          productName,
+          size: item.variant?.size,
+          color: item.variant?.color,
+          onlineEnabled: true,
+        });
+        if (inv) {
+          const available = inv.totalStock - inv.onlineSold - inv.offlineSold
+            - (inv.reservedStock || 0) + inv.returned - inv.damaged;
+          maxQty = Math.max(0, available);
+        }
+      }
+
+      item.quantity = Math.min(maxQty, quantity);
     }
 
     await cart.save();

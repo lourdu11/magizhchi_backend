@@ -123,7 +123,6 @@ exports.updateReviewStatus = async (req, res, next) => {
 
     return ApiResponse.success(res, null, `Review ${status} successfully`);
   } catch (error) { 
-    console.error('[CRITICAL] updateReviewStatus Atomic Failed:', error);
     next(error); 
   }
 };

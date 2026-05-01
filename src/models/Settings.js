@@ -13,7 +13,8 @@ const settingsSchema = new mongoose.Schema(
       whatsapp: String,
     },
     shipping: {
-      flatRate: { type: Number, default: 50 },
+      flatRateTN: { type: Number, default: 50 },
+      flatRateOut: { type: Number, default: 100 },
       freeShippingThreshold: { type: Number, default: 999 },
       estimatedDays: {
         metro: { type: Number, default: 3 },
@@ -22,10 +23,10 @@ const settingsSchema = new mongoose.Schema(
       },
     },
     gst: {
-      rate: { type: Number, default: 18 },
+      rate: { type: Number, default: 5 },
       enabled: { type: Boolean, default: true },
-      cgst: { type: Number, default: 9 },
-      sgst: { type: Number, default: 9 },
+      cgst: { type: Number, default: 2.5 },
+      sgst: { type: Number, default: 2.5 },
     },
     social: {
       facebook: String,
@@ -34,11 +35,12 @@ const settingsSchema = new mongoose.Schema(
       youtube: String,
     },
     payment: {
+      onlineEnabled: { type: Boolean, default: true },
       razorpayKeyId: String,
       razorpayKeySecret: { type: String, select: false },
       codEnabled: { type: Boolean, default: true },
       codCharges: { type: Number, default: 50 },
-      codThreshold: { type: Number, default: 5000 },
+      codThreshold: { type: Number, default: 50000 },
     },
     notifications: {
       email: {
@@ -46,11 +48,16 @@ const settingsSchema = new mongoose.Schema(
         port: { type: Number, default: 587 },
         user: String,
         password: { type: String, select: false },
+        alertEmail: String,
       },
       whatsapp: {
         adminPhone: { type: String, default: '7358885452' },
         apiKey: { type: String, select: false },
       },
+      lowStockAlert: {
+        enabled: { type: Boolean, default: true },
+        method: { type: String, enum: ['whatsapp', 'email', 'both'], default: 'whatsapp' },
+      }
     },
 
     seo: {

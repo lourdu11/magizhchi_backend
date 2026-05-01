@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const path = require('path');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
@@ -48,13 +49,6 @@ const { protect, isAdmin } = require('./src/middlewares/auth');
 
 const app = express();
 
-app.use((req, res, next) => {
-  console.log(`>>> [${new Date().toISOString()}] ${req.method} ${req.path}`);
-  if (req.method === 'PUT' || req.method === 'POST') {
-    console.log('>>> Payload keys:', Object.keys(req.body || {}));
-  }
-  next();
-});
 
 // ─── Security Middleware ───────────────────────────────────────
 app.use(helmet());
@@ -86,7 +80,8 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-rtb-fingerprint-id', 'request-id'],
+  exposedHeaders: ['x-rtb-fingerprint-id', 'request-id'],
 }));
 
 app.use(mongoSanitize); // Prevent NoSQL injection
@@ -98,6 +93,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cookieParser());
 app.use(compression());
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // ─── Logging ──────────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'test') {
@@ -107,7 +103,7 @@ if (process.env.NODE_ENV !== 'test') {
 }
 
 // ─── Global Rate Limiter ──────────────────────────────────────
-// app.use('/api', defaultLimiter);
+app.use('/api', defaultLimiter);
 
 // ─── Health Check ─────────────────────────────────────────────
 app.get('/', (req, res) => {
@@ -115,13 +111,26 @@ app.get('/', (req, res) => {
 });
 
 app.get('/api/v1/health', (req, res) => {
-  res.json({ success: true, message: 'Magizhchi API is running', timestamp: new Date().toISOString() });
+  const { isReady, getQRLink } = require('./src/services/whatsapp.service');
+  const ready = isReady();
+  res.json({ 
+    success: true, 
+    message: 'Magizhchi API is running', 
+    whatsapp: ready ? 'Ready' : 'Not Connected',
+    qrLink: !ready ? getQRLink() : null,
+    timestamp: new Date().toISOString() 
+  });
 });
 
 // ─── API Routes ───────────────────────────────────────────────
 const API = '/api/v1';
+
+// VIP Priority Routes (Procurement & Scanning)
+app.use(`${API}/admin/inventory`, protect, isAdmin, require('./src/routes/inventory.routes'));
+app.use(`${API}/admin`, adminRoutes);
+
 app.use(`${API}/public`, publicRoutes);
-app.post(`${API}/contact`, publicController.submitContactForm); // Direct mount for reliability
+app.post(`${API}/contact`, publicController.submitContactForm); 
 app.use(`${API}/auth`, authRoutes);
 app.use(`${API}/products`, productRoutes);
 app.use(`${API}/categories`, categoryRoutes);
@@ -129,11 +138,13 @@ app.use(`${API}/cart`, cartRoutes);
 app.use(`${API}/wishlist`, wishlistRoutes);
 app.use(`${API}/orders`, orderRoutes);
 app.use(`${API}/bills`, billRoutes);
-app.use(`${API}/admin`, adminRoutes);
 app.use(`${API}/coupons`, couponRoutes);
 app.use(`${API}/reviews`, reviewRoutes);
 app.use(`${API}/banners`, bannerRoutes);
 app.use(`${API}/users`, userRoutes);
+
+// Debug route to verify route health
+app.get(`${API}/health/procurement`, (req, res) => res.json({ status: 'active', routes: ['admin/purchases', 'admin/suppliers'] }));
 
 // ─── Utility Routes ───────────────────────────────────────────
 app.post(`${API}/upload`, protect, isAdmin, upload.single('image'), (req, res) => {
@@ -147,11 +158,11 @@ app.post(`${API}/upload`, protect, isAdmin, upload.single('image'), (req, res) =
 
 // ─── 404 Handler ──────────────────────────────────────────────
 app.use((req, res) => {
-  console.warn(`[404] No route found for ${req.method} ${req.originalUrl}`);
   res.status(404).json({ success: false, message: `Route ${req.originalUrl} not found` });
 });
 
 // ─── Global Error Handler ─────────────────────────────────────
 app.use(errorHandler);
 
+// Final trigger for route migration
 module.exports = app;

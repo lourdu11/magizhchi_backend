@@ -47,6 +47,14 @@ exports.validateCoupon = async (req, res, next) => {
       return ApiResponse.error(res, 'Coupon usage limit reached', 400);
     }
 
+    // Per-user limit check
+    if (req.user && coupon.usageLimit?.perUser) {
+      const timesUsed = coupon.usedBy.filter(id => id.toString() === req.user._id.toString()).length;
+      if (timesUsed >= coupon.usageLimit.perUser) {
+        return ApiResponse.error(res, `You have already used this coupon the maximum allowed times`, 400);
+      }
+    }
+
     // Calculate discount
     let discount = 0;
     if (coupon.discountType === 'percentage') {

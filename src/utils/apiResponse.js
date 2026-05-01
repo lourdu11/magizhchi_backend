@@ -42,6 +42,10 @@ class ApiResponse {
     return res.status(403).json({ success: false, message });
   }
 
+  static badRequest(res, message = 'Bad Request') {
+    return res.status(400).json({ success: false, message });
+  }
+
   static validationError(res, errors) {
     return res.status(422).json({ success: false, message: 'Validation failed', errors });
   }

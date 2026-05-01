@@ -23,8 +23,18 @@ exports.submitContactForm = async (req, res, next) => {
 
 exports.getPublicSettings = async (req, res, next) => {
   try {
-    const settings = await Settings.findOne();
-    return ApiResponse.success(res, settings);
+    const settings = await Settings.findOne()
+      .select('store shipping payment seo')
+      .lean();
+
+    // Provide safe defaults if no settings document exists yet
+    const response = {
+      store: { name: 'Magizhchi Garments', email: '', phone: '', address: '', gstin: '', ...(settings?.store || {}) },
+      shipping: { flatRateTN: 50, flatRateOut: 100, freeShippingThreshold: 999, ...(settings?.shipping || {}) },
+      payment: { onlineEnabled: true, codEnabled: true, codCharges: 50, codThreshold: 50000, ...(settings?.payment || {}) },
+      seo: settings?.seo || {}
+    };
+    return ApiResponse.success(res, response);
   } catch (e) {
     next(e);
   }

@@ -67,16 +67,21 @@ exports.login = async (req, res, next) => {
       if (user.isBlocked)
         return ApiResponse.forbidden(res, 'Account blocked. Contact support.');
 
-      if (user.isLocked) {
+      // Check if account is locked
+      if (user.lockUntil && user.lockUntil > Date.now()) {
         const remaining = Math.ceil((user.lockUntil - Date.now()) / 60000);
         return ApiResponse.error(res, `Too many failed attempts. Try after ${remaining} minutes.`, 423);
       }
 
       const isMatch = await user.comparePassword(password);
       if (!isMatch) {
-        await user.incLoginAttempts();
-        const attempts = (user.loginAttempts || 0) + 1;
-        const remaining = Math.max(0, 5 - attempts);
+        const newAttempts = (user.loginAttempts || 0) + 1;
+        const updateData = { loginAttempts: newAttempts };
+        if (newAttempts >= 5) {
+          updateData.lockUntil = new Date(Date.now() + 15 * 60 * 1000); // lock 15 min
+        }
+        await User.findByIdAndUpdate(user._id, updateData);
+        const remaining = Math.max(0, 5 - newAttempts);
         return ApiResponse.error(
           res,
           `Incorrect password.${remaining > 0 ? ` ${remaining} attempts left.` : ' Account locked for 15 min.'}`,
@@ -109,8 +114,6 @@ exports.login = async (req, res, next) => {
 exports.forgotPassword = async (req, res, next) => {
   try {
     const { identifier } = req.body;
-    console.log('DEBUG: Forgot Password request for:', identifier);
-    
     if (!identifier)
       return ApiResponse.error(res, 'Email or phone number required', 400);
 
@@ -119,11 +122,11 @@ exports.forgotPassword = async (req, res, next) => {
     const user = await User.findOne(query);
 
     if (!user) {
-      // Don't reveal if user exists (security best practice)
-      return ApiResponse.success(res, null,
+      return ApiResponse.error(res, 
         isEmail(identifier)
-          ? 'If this email is registered, OTP has been sent.'
-          : 'If this phone is registered, OTP has been sent on WhatsApp.'
+          ? 'This email is not registered. Please login first to create an account.'
+          : 'This phone number is not registered. Please login first to create an account.',
+        404
       );
     }
 
@@ -293,4 +296,37 @@ exports.changePassword = async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+};
+
+/**
+ * Create a dummy guest user instantly
+ */
+exports.quickGuestUser = async (req, res, next) => {
+  try {
+    // Generate a high-precision unique ID
+    const ts = Date.now().toString();
+    const uniqueId = ts.slice(-8) + Math.floor(Math.random() * 100);
+    
+    const guestEmail = `guest_${uniqueId}@magizhchi.com`;
+    const guestName = `Guest_${ts.slice(-4)}`;
+    const guestPhone = `00${uniqueId.slice(0, 8)}`; // Unique dummy phone to satisfy unique index
+
+    const user = await User.create({
+      name: guestName,
+      email: guestEmail,
+      phone: guestPhone,
+      password: `guest_${uniqueId}_secret`,
+      role: 'user',
+      isVerified: true
+    });
+
+    const { accessToken, refreshToken } = generateTokens(user._id);
+    await User.findByIdAndUpdate(user._id, { refreshToken });
+    setCookies(res, accessToken, refreshToken);
+
+    return ApiResponse.success(res, {
+      user: { _id: user._id, name: user.name, email: user.email, role: user.role },
+      accessToken
+    }, 'Demo profile created! Welcome to Magizhchi.');
+  } catch (error) { next(error); }
 };

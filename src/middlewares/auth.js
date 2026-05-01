@@ -69,27 +69,19 @@ const optionalAuth = async (req, res, next) => {
 
     if (token) {
       try {
-        console.log('DEBUG: Found token in request. Verifying...');
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         const user = await User.findById(decoded.id).select('-password');
         if (user && !user.isBlocked) {
-          console.log('DEBUG: User authenticated:', user.email);
           req.user = user;
-        } else {
-          console.log('DEBUG: Token valid but user not found or blocked.');
         }
       } catch (e) {
-        console.log('DEBUG: Token invalid or expired. Proceeding as guest.');
+        // Token invalid or expired — continue as guest
       }
-    } else {
-      console.log('DEBUG: No token found. Proceeding as guest.');
     }
   } catch (err) {
-    console.log('DEBUG: OptionalAuth error:', err.message);
+    // Silent fail — guest access still proceeds
   }
   next();
-
-
 };
 
 module.exports = { protect, authorize, isAdmin, isStaff, isUser, optionalAuth };

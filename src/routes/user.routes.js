@@ -72,7 +72,14 @@ r.put('/addresses/:id', protect, async (req, res, next) => {
 r.delete('/addresses/:id', protect, async (req, res, next) => {
   try {
     const user = await User.findById(req.user._id);
-    user.addresses = user.addresses.filter(a => a._id.toString() !== req.params.id);
+    const wasDefault = user.addresses.id(req.params.id)?.isDefault;
+    user.addresses.pull(req.params.id);
+    
+    // If we deleted the default, make the first one default
+    if (wasDefault && user.addresses.length > 0) {
+      user.addresses[0].isDefault = true;
+    }
+    
     await user.save();
     const updated = await User.findById(req.user._id).select('-password');
     return ApiResponse.success(res, updated, 'Address removed');

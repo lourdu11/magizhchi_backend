@@ -6,7 +6,7 @@ const { protect, isAdmin } = require('../middlewares/auth');
 const { optionalAuth } = require('../middlewares/auth');
 
 r.post('/create', optionalAuth, orderController.createOrder);
-r.post('/verify-payment', protect, orderController.verifyPayment);
+r.post('/verify-payment', optionalAuth, orderController.verifyPayment);
 r.get('/my-orders', protect, orderController.getUserOrders);
 r.get('/all', protect, isAdmin, orderController.getAllOrders);
 r.get('/:id', protect, orderController.getOrder);

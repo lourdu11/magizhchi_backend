@@ -24,12 +24,21 @@ const startServer = async () => {
       logger.info('📱 WhatsApp: Starting... Scan QR code when it appears below ↓');
       initWhatsApp();
     }
+
+    // Verify Email Configuration
+    const { verifyEmailConfig } = require('./src/config/email');
+    verifyEmailConfig();
   });
 
 
   // Graceful shutdown
-  const gracefulShutdown = (signal) => {
+  const gracefulShutdown = async (signal) => {
     logger.info(`${signal} received. Shutting down gracefully...`);
+    
+    // Close WhatsApp if active
+    const { closeWhatsApp } = require('./src/services/whatsapp.service');
+    await closeWhatsApp();
+
     server.close(() => {
       logger.info('HTTP server closed.');
       process.exit(0);

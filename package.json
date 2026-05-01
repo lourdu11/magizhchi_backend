@@ -26,6 +26,7 @@
     "jsonwebtoken": "^9.0.3",
     "libsignal-node": "^2.0.1",
     "mongoose": "^9.5.0",
+    "mongoose-lean-virtuals": "^2.1.0",
     "morgan": "^1.10.1",
     "multer": "^2.1.1",
     "multer-storage-cloudinary": "^4.0.0",

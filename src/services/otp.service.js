@@ -50,9 +50,10 @@ const sendOTP = async (identifier, purpose = 'register') => {
       await sendEmailOTP(identifier, otp, purpose);
       return { method: 'email', message: `OTP sent to ${maskEmail(identifier)}` };
     } catch (err) {
+      logger.error(`❌ EMAIL OTP SEND ERROR to ${identifier}:`, err.message);
       if (isDev) {
-        logger.warn(`Email send failed — OTP printed in terminal above`);
-        return { method: 'dev_console', message: 'OTP sent to terminal (email not configured)' };
+        logger.warn(`Email send failed — This is common in Dev if SMTP is not set. OTP is printed in terminal above.`);
+        return { method: 'dev_console', message: 'OTP sent to terminal (Email Error: ' + err.message + ')' };
       }
       throw err;
     }
@@ -64,13 +65,10 @@ const sendOTP = async (identifier, purpose = 'register') => {
       await sendWhatsAppOTP_Own(identifier, otp, purpose);
       return { method: 'whatsapp', message: `OTP sent to WhatsApp ${maskPhone(identifier)}` };
     } catch (err) {
-      // LOG THE ACTUAL ERROR HERE FOR ANALYSIS
-      logger.error('❌ WHATSAPP SEND ERROR:', err.message);
-      if (err.stack) logger.error(err.stack);
-
+      logger.error(`❌ WHATSAPP OTP SEND ERROR to ${identifier}:`, err.message);
       if (isDev) {
-        logger.warn(`WhatsApp send failed — falling back to terminal log.`);
-        return { method: 'dev_console', message: 'OTP sent to terminal (WhatsApp Error)' };
+        logger.warn(`WhatsApp send failed — Ensure QR is scanned. Falling back to terminal log.`);
+        return { method: 'dev_console', message: 'OTP sent to terminal (WhatsApp Error: ' + err.message + ')' };
       }
       throw err;
     }

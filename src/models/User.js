@@ -54,6 +54,7 @@ const userSchema = new mongoose.Schema(
     loginAttempts: { type: Number, default: 0 },
     lockUntil: { type: Date },
     refreshToken: { type: String, select: false },
+    commissionRate: { type: Number, default: 0 }, // For staff: percentage of sales
   },
   { timestamps: true }
 );

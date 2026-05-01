@@ -167,4 +167,57 @@ const sendOrderConfirmationEmail = async (email, order) => {
   logger.info(`Order confirmation sent to: ${email} [order: ${order.orderNumber}]`);
 };
 
-module.exports = { sendOTPEmail, sendOrderConfirmationEmail };
+// ─── Low Stock Alert Email ─────────────────────────────────────
+const sendLowStockEmail = async (email, item, currentStock) => {
+  const { storeName, from } = await getEmailSettings();
+  const transporter = await getTransporter();
+
+  const html = `
+<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#f5f5f5;font-family:'Segoe UI',Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f5;padding:30px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;">
+        <tr><td style="background:#1A1A1A;padding:28px 40px;text-align:center;">
+          <div style="font-family:Georgia,serif;font-size:22px;font-weight:bold;color:#D4AF37;letter-spacing:5px;">MAGIZHCHI</div>
+          <div style="font-size:9px;color:rgba(255,255,255,0.4);letter-spacing:5px;">GARMENTS</div>
+        </td></tr>
+        <tr><td style="padding:40px;">
+          <div style="background:#fff5f5;border:1px solid #feb2b2;border-radius:8px;padding:16px;text-align:center;margin-bottom:24px;">
+            <div style="font-size:28px;margin-bottom:6px;">🚨</div>
+            <h2 style="margin:0;color:#c53030;font-size:18px;">Low Stock Alert</h2>
+          </div>
+          <p style="color:#1A1A1A;font-size:15px;line-height:1.6;">
+            The following product has reached its low stock threshold:
+          </p>
+          <div style="background:#f9f9f9;border-radius:8px;padding:20px;margin:20px 0;">
+            <p style="margin:0 0 10px;"><strong>Product:</strong> ${item.productName}</p>
+            <p style="margin:0 0 10px;"><strong>Variant:</strong> ${item.color} / ${item.size}</p>
+            <p style="margin:0 0 10px;"><strong>Current Stock:</strong> <span style="color:#c53030;font-weight:bold;">${currentStock} Units</span></p>
+            <p style="margin:0;"><strong>Threshold:</strong> ${item.lowStockThreshold || 5}</p>
+          </div>
+          <p style="color:#666;font-size:13px;">
+            Please restock this item soon to avoid missing out on sales.
+          </p>
+        </td></tr>
+        <tr><td style="background:#f9f9f9;border-top:1px solid #eee;padding:16px 40px;text-align:center;">
+          <p style="margin:0;color:#bbb;font-size:11px;">&copy; ${new Date().getFullYear()} ${storeName}.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+  await transporter.sendMail({
+    from: from,
+    to: email,
+    subject: `🚨 Low Stock Alert: ${item.productName} — ${storeName}`,
+    html,
+  });
+
+  logger.info(`Low stock alert email sent to: ${email} [product: ${item.productName}]`);
+};
+
+module.exports = { sendOTPEmail, sendOrderConfirmationEmail, sendLowStockEmail };

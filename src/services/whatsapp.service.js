@@ -15,6 +15,9 @@ const Settings = require('../models/Settings');
 let sock = null;
 let isReady = false;
 let isInitializing = false;
+let lastInitTime = 0;
+let currentQR = null;
+let reconnectTimeout = null;
 
 /**
  * ARCHITECTURE: PURE SOCKET MODE (NO BROWSER)
@@ -35,9 +38,42 @@ const getAdminSettings = async () => {
   }
 };
 
+const closeWhatsApp = async () => {
+    if (sock) {
+        try {
+            logger.info('📱 WhatsApp: Closing socket...');
+            sock.ev.removeAllListeners();
+            // Using end() instead of logout() for faster shutdown during restarts
+            sock.end();
+            sock = null;
+            isReady = false;
+        } catch (e) {
+            // Ignore errors on close
+        }
+    }
+};
+
 const initWhatsApp = async () => {
-    if (isInitializing) return;
+    const now = Date.now();
+    // Prevent initializing more than once every 10 seconds to avoid conflict loops
+    if (isInitializing || (now - lastInitTime < 10000)) {
+        if (isInitializing) logger.debug('📱 WhatsApp: Already initializing, skipping...');
+        return;
+    }
+    
     isInitializing = true;
+    lastInitTime = now;
+
+    // If there's an existing socket, close it first
+    if (sock) {
+        logger.info('📱 WhatsApp: Ensuring previous socket is closed...');
+        try {
+            sock.ev.removeAllListeners();
+            sock.end();
+        } catch (e) {}
+        sock = null;
+        await new Promise(resolve => setTimeout(resolve, 3000));
+    }
 
     const sessionPath = path.resolve(__dirname, '../../.whatsapp-session/baileys-auth');
     if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath, { recursive: true });
@@ -55,7 +91,12 @@ const initWhatsApp = async () => {
         },
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
-        browser: ['Ubuntu', 'Chrome', '20.0.04'],
+        browser: ['Magizhchi ERP', 'Chrome', '110.0.0'], // More unique browser name
+        syncFullHistory: false, // Don't sync old messages to reduce conflict chance
+        markOnlineOnConnect: false, // Don't mark as online immediately
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0,
+        keepAliveIntervalMs: 60000, // Increase keep-alive
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -64,6 +105,7 @@ const initWhatsApp = async () => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
+            currentQR = qr;
             logger.info('📱 WhatsApp: [NEW QR CODE] Scan the LATEST link below:');
             qrcode.generate(qr, { small: true });
             
@@ -72,11 +114,45 @@ const initWhatsApp = async () => {
         }
 
         if (connection === 'close') {
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            logger.warn(`⚠️ WhatsApp: Connection closed. Reason: ${lastDisconnect?.error?.message}. Reconnecting: ${shouldReconnect}`);
+            const errorCode = lastDisconnect?.error?.output?.statusCode;
+            const errorMsg = lastDisconnect?.error?.message || 'Unknown Error';
+            
+            // If logged out or credentials invalid, clear session to force new QR
+            if (errorCode === DisconnectReason.loggedOut || errorCode === 401) {
+                logger.warn('🚫 WhatsApp: Session expired or logged out. Clearing session files...');
+                const sessionPath = path.resolve(__dirname, '../../.whatsapp-session/baileys-auth');
+                if (fs.existsSync(sessionPath)) {
+                    fs.rmSync(sessionPath, { recursive: true, force: true });
+                }
+                isReady = false;
+                isInitializing = false;
+                initWhatsApp(); // Restart to get new QR
+                return;
+            }
+
+            const shouldReconnect = errorCode !== DisconnectReason.loggedOut;
+            logger.warn(`⚠️ WhatsApp: Connection closed. Reason: ${errorMsg} (Code: ${errorCode}). Reconnecting: ${shouldReconnect}`);
+            
             isReady = false;
             isInitializing = false;
-            if (shouldReconnect) initWhatsApp();
+            
+            if (shouldReconnect) {
+                // If it's a conflict (440, 428), another instance is likely running.
+                // We wait much longer to allow the other instance to timeout or close.
+                const delay = (errorCode === 440 || errorCode === 428) ? 30000 : 10000;
+                
+                if (errorCode === 440 || errorCode === 428) {
+                    logger.error(`🚨 WhatsApp CONFLICT (Code ${errorCode}): Another instance is active.`);
+                    logger.error('👉 Please close ALL other terminal windows and wait for this instance to repair.');
+                }
+
+                logger.info(`🔄 WhatsApp: Auto-repair cooldown (${delay/1000}s)...`);
+                
+                if (reconnectTimeout) clearTimeout(reconnectTimeout);
+                reconnectTimeout = setTimeout(() => {
+                    initWhatsApp();
+                }, delay);
+            }
         } else if (connection === 'open') {
             isReady = true;
             isInitializing = false;
@@ -190,6 +266,23 @@ const sendProductNotificationToAdmin = async (product, action = 'updated') => {
     return await sendMessage(adminPhone, msg);
 };
 
+const sendStockAlertToAdmin = async (item, currentStock) => {
+    const { adminPhone } = await getAdminSettings();
+    if (!adminPhone) return;
+
+    const msg = `🚨 *LOW STOCK ALERT*\n` +
+                `*Magizhchi Garments*\n` +
+                `──────────────────\n\n` +
+                `📦 *Product:* ${item.productName}\n` +
+                `🎨 *Variant:* ${item.color} / ${item.size}\n` +
+                `📉 *Current Stock:* *${currentStock}*\n` +
+                `⚠️ *Threshold:* ${item.lowStockThreshold || 5}\n\n` +
+                `──────────────────\n` +
+                `*Please restock this item soon.*`;
+
+    return await sendMessage(adminPhone, msg);
+};
+
 const sendWhatsAppOTP = async (phone, otp) => {
     const { storeName } = await getAdminSettings();
     const msg = `🔐 *SECURE OTP*\n` +
@@ -221,5 +314,8 @@ module.exports = {
     sendOrderCancellationNotificationToAdmin,
     sendContactMessageNotificationToAdmin,
     sendProductNotificationToAdmin,
-    isReady: () => isReady
+    sendStockAlertToAdmin,
+    isReady: () => isReady,
+    getQRLink: () => currentQR ? `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(currentQR)}&size=300x300` : null,
+    closeWhatsApp
 };
